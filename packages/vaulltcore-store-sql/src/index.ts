@@ -1,4 +1,5 @@
 export { SqlJobStore, type SqlJobStoreOptions, type SqlJobStoreHooks } from "./sql-store"
+export { SqlStoreBase, type SqlStoreBaseOptions, isUniqueViolation } from "./store-base"
 export { DistributedSqlStore, type DistributedSqlStoreOptions } from "./distributed-store"
 export { SqlIdempotencyRegistry, SqlSnapshotRegistry } from "./registries"
 export { SqlDispatcher } from "./dispatcher"

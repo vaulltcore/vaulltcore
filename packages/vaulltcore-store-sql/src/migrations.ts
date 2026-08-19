@@ -155,13 +155,19 @@ const LEDGER = `CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at BIGINT NOT NULL
 )`
 
-/** Apply pending migrations in version order. Returns applied versions. */
-export function applyMigrations(db: SqlDatabase): number[] {
+/** Apply pending migrations in version order. Returns applied versions.
+ *
+ * The migration ledger (`schema_migrations`) is shared across all stores that
+ * wrap the same {@link SqlDatabase}: version numbers are globally unique, so a
+ * business-layer store may pass its own migration list (Phase 1E) and already
+ * applied versions are skipped. This lets durable business state share the
+ * execution store's database without duplicating the migration machinery. */
+export function applyMigrations(db: SqlDatabase, migrations: readonly Migration[] = MIGRATIONS): number[] {
   db.exec(LEDGER)
   const appliedRows = db.prepare("SELECT version FROM schema_migrations").all()
   const applied = new Set(appliedRows.map((row) => Number(row.version)))
   const newlyApplied: number[] = []
-  for (const migration of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
+  for (const migration of [...migrations].sort((a, b) => a.version - b.version)) {
     if (applied.has(migration.version)) continue
     db.exec("BEGIN")
     try {

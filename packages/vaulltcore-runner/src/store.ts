@@ -10,6 +10,7 @@
 
 import type { JobCheckpoint, JobEvent, JobRecord, NewJobEvent } from "./contracts"
 import { IdentityMismatchError } from "./errors"
+import type { LeaseRenewalResult } from "./distributed"
 
 /** Fields frozen at creation: tenant identity and job wiring can never change. */
 export const IMMUTABLE_JOB_FIELDS = ["jobId", "tenantId", "orgId", "projectId", "createdAt", "spec", "env", "policy"] as const
@@ -46,6 +47,15 @@ export interface DurableJobStore {
    * lease is held by another token.
    */
   acquireLease(jobId: string, leaseToken: string, leaseMs: number): Promise<LeaseGrant>
+  /**
+   * Phase 1D: fenced lease renewal (the heartbeat durability path). Renewal
+   * must itself be fenced — a stale worker waking up after a network
+   * partition can never reclaim authority. Extends `expiresAt` only when the
+   * caller's token matches the current lease; otherwise returns a fenced
+   * result (never throws, so a supervisor can classify expiry deterministically).
+   * Optional: stores without it keep the Phase 1A/1B acquire-on-expiry model.
+   */
+  renewLease?(jobId: string, leaseToken: string, leaseMs: number): Promise<LeaseRenewalResult>
   /** Explicitly release ownership (no-op when already released). */
   releaseLease?(jobId: string, leaseToken: string): Promise<void>
   /**

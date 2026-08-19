@@ -16,9 +16,9 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
-import { type AgentRunner, type CreateJobInput, type ExecutionPolicy, JobNotFoundError, VaulltcoreError } from "@vaulltcore/runner"
+import { type AgentRunner, type CreateJobInput, type ExecutionPolicy, type JobRecord, JobNotFoundError, VaulltcoreError } from "@vaulltcore/runner"
 import { type AuthnPrincipal, type ControlAuthenticator, HeaderAuthenticator } from "./auth"
-import { type IdempotencyRegistry, InMemoryIdempotencyRegistry } from "./idempotency"
+import { type IdempotencyRegistry, InMemoryIdempotencyRegistry, requestHashFor } from "./idempotency"
 
 export interface ControlPlaneOptions {
   readonly runner: AgentRunner
@@ -133,14 +133,49 @@ export class ControlPlane {
       return
     }
     const body = (await this.readBody(req)) as CreateJobRequestBody
-    const existing = await this.idempotency.lookup(principal.tenantId, key)
-    if (existing) {
-      const reused = await this.runner.getJob(existing)
+    // Phase 1D: claim the (tenant, key) slot with a request hash. Same tenant +
+    // same key + same request ⇒ return original job; a different request ⇒ 409.
+    // Different tenants may use identical keys without collision.
+    const requestHash = requestHashFor(body)
+    const claimResult = await this.idempotency.claim({ tenantId: principal.tenantId, key, requestHash })
+    if (claimResult.kind === "fulfilled") {
+      const reused = await this.runner.getJob(claimResult.jobId)
       if (reused) {
         this.json(res, 200, reused)
         return
       }
+      // Fulfilled record but job missing (data loss): clear the stale slot and
+      // re-claim so the new job is recorded durably.
+      await this.idempotency.delete(principal.tenantId, key)
+      const reClaim = await this.idempotency.claim({ tenantId: principal.tenantId, key, requestHash })
+      if (reClaim.kind === "conflict") {
+        this.json(res, 409, { error: { code: "IDEMPOTENCY_CONFLICT", message: reClaim.detail, jobId: reClaim.jobId } })
+        return
+      }
+      if (reClaim.kind !== "new") {
+        // Unexpected; treat as a transient conflict.
+        this.json(res, 409, { error: { code: "IDEMPOTENCY_CONFLICT", message: "idempotency slot not creatable", jobId: null } })
+        return
+      }
+      await this.createAndFulfill(res, principal, body, reClaim.slotId, key)
+      return
     }
+    if (claimResult.kind === "conflict") {
+      this.json(res, 409, { error: { code: "IDEMPOTENCY_CONFLICT", message: claimResult.detail, jobId: claimResult.jobId } })
+      return
+    }
+    // claimResult.kind is "new" or "pending" (pending = creator crashed mid-
+    // create; safe to re-attempt the same request). Create the job and fulfill.
+    await this.createAndFulfill(res, principal, body, claimResult.slotId, key)
+  }
+
+  private async createAndFulfill(
+    res: ServerResponse,
+    principal: AuthnPrincipal,
+    body: CreateJobRequestBody,
+    slotId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
     const spec = body.spec ?? {}
     const input: CreateJobInput = {
       tenantId: principal.tenantId,
@@ -153,8 +188,19 @@ export class ControlPlane {
       },
       policy: body.policy,
     }
-    const record = await this.runner.createJob(input)
-    await this.idempotency.record(principal.tenantId, key, record.jobId)
+    let record: JobRecord
+    try {
+      record = await this.runner.createJob(input)
+    } catch (error) {
+      // Job creation failed: release the pending slot so a retry isn't stuck
+      // returning "pending" forever. The next identical request re-claims.
+      await Promise.resolve(this.idempotency.delete(principal.tenantId, idempotencyKey)).catch(() => {})
+      throw error
+    }
+    // Fulfill the slot with the created job + response status. This is the
+    // durability boundary: after this call, a crash+retry returns the original
+    // job (kind "fulfilled") instead of creating a duplicate.
+    await this.idempotency.fulfill(slotId, record.jobId, 201)
     this.json(res, 201, { id: record.jobId, status: record.status })
   }
 

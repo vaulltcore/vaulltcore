@@ -1,4 +1,5 @@
 export { SqlJobStore, type SqlJobStoreOptions, type SqlJobStoreHooks } from "./sql-store"
+export { SqlStoreBase, type SqlStoreBaseOptions, isUniqueViolation } from "./store-base"
 export {
   NodeSqliteDatabase,
   sqliteDialect,

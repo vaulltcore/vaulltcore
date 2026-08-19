@@ -19,13 +19,40 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { type AgentRunner, type CreateJobInput, type ExecutionPolicy, JobNotFoundError, VaulltcoreError } from "@vaulltcore/runner"
 import { type AuthnPrincipal, type ControlAuthenticator, HeaderAuthenticator } from "./auth"
 import { type IdempotencyRegistry, InMemoryIdempotencyRegistry } from "./idempotency"
+import { AdmissionPipeline, type AdmissionDeps, type AdmissionRequest, AdmissionError, InMemoryAdmissionIdempotencyRegistry } from "./admission"
+import type { SqlIdentityStore, ResolvedPrincipal } from "@vaulltcore/identity"
+import type { SqlPolicyStore } from "@vaulltcore/policy"
+import type { SqlQuotaStore } from "@vaulltcore/quota"
+import type { SqlMeteringStore } from "@vaulltcore/metering"
+import type { SqlBillingStore } from "@vaulltcore/billing"
+import type { SqlAuditStore } from "@vaulltcore/audit"
 
 export interface ControlPlaneOptions {
   readonly runner: AgentRunner
   /** Replaceable authentication boundary (defaults to test headers). */
   readonly authenticator?: ControlAuthenticator
-  /** Replaceable idempotency registry (defaults to in-memory). */
+  /** Replaceable idempotency registry (defaults to in-memory). Used only when
+   *  the legacy (non-business) POST /jobs path is active. */
   readonly idempotency?: IdempotencyRegistry
+  /** Optional business layer. When provided, POST /jobs routes through the
+   *  {@link AdmissionPipeline} (authenticate → authorize → policy → quota →
+   *  create) and read endpoints expose organizations/projects/quotas/usage/
+   *  billing/audit. When absent, the legacy thin-façade behavior is preserved. */
+  readonly business?: BusinessLayerOptions
+}
+
+/** Business-layer wiring. All stores share one SQL database. */
+export interface BusinessLayerOptions {
+  readonly identity: SqlIdentityStore
+  readonly policy: SqlPolicyStore
+  readonly quota: SqlQuotaStore
+  readonly metering: SqlMeteringStore
+  readonly billing: SqlBillingStore
+  readonly audit: SqlAuditStore
+  /** Authenticator that resolves a bearer API key into a ResolvedPrincipal.
+   *  When set, the control plane authenticates via the identity store. */
+  readonly apiKeyAuthenticator?: (secret: string) => Promise<ResolvedPrincipal | null>
+  readonly admissionIdempotency?: import("./admission").AdmissionIdempotencyRegistry
 }
 
 interface CreateJobRequestBody {
@@ -33,8 +60,12 @@ interface CreateJobRequestBody {
     engine?: string
     model?: string
     input?: string
+    engineOptions?: Record<string, unknown>
   }
   policy?: Partial<ExecutionPolicy>
+  /** Only honored when the business layer is active and the authn principal's
+   *  project scope is the wildcard "*". */
+  projectId?: string
 }
 
 type Handler = (
@@ -52,17 +83,41 @@ export class ControlPlane {
   private readonly authenticator: ControlAuthenticator
   private readonly idempotency: IdempotencyRegistry
   private readonly routes: Array<{ method: string; pattern: RegExp; keys: string[]; handler: Handler }> = []
+  private readonly business: BusinessLayerOptions | null
+  private readonly admission: AdmissionPipeline | null
 
   constructor(options: ControlPlaneOptions) {
     this.runner = options.runner
     this.authenticator = options.authenticator ?? new HeaderAuthenticator()
     this.idempotency = options.idempotency ?? new InMemoryIdempotencyRegistry()
+    this.business = options.business ?? null
+    this.admission = this.business
+      ? new AdmissionPipeline({
+          runner: this.runner,
+          identity: this.business.identity,
+          policy: this.business.policy,
+          quota: this.business.quota,
+          audit: this.business.audit,
+          idempotency: this.business.admissionIdempotency ?? new InMemoryAdmissionIdempotencyRegistry(),
+        })
+      : null
     this.add("POST", "/jobs", this.createJob)
     this.add("GET", "/jobs/:jobId", this.getJob)
     this.add("POST", "/jobs/:jobId/cancel", this.cancelJob)
     this.add("POST", "/jobs/:jobId/input", this.submitInput)
     this.add("GET", "/jobs/:jobId/usage", this.getUsage)
     this.add("GET", "/jobs/:jobId/events", this.events)
+    // Business-layer read endpoints (no-op when business layer absent).
+    this.add("GET", "/organizations", this.listOrganizations)
+    this.add("GET", "/organizations/:orgId/projects", this.listProjects)
+    this.add("GET", "/organizations/:orgId/quotas", this.listQuotas)
+    this.add("GET", "/organizations/:orgId/usage", this.getScopeUsage)
+    this.add("GET", "/organizations/:orgId/ledger", this.getLedger)
+    this.add("GET", "/organizations/:orgId/audit", this.getAudit)
+    this.add("GET", "/organizations/:orgId/projects/:projectId/quotas", this.listProjectQuotas)
+    this.add("GET", "/organizations/:orgId/projects/:projectId/usage", this.getProjectUsage)
+    this.add("GET", "/organizations/:orgId/projects/:projectId/ledger", this.getProjectLedger)
+    this.add("GET", "/organizations/:orgId/projects/:projectId/audit", this.getProjectAudit)
   }
 
   private add(method: string, path: string, handler: Handler): void {
@@ -102,6 +157,10 @@ export class ControlPlane {
       })
       await route.handler(req, res, params, principal!, url.searchParams)
     } catch (error) {
+      if (error instanceof AdmissionError) {
+        this.json(res, error.status, { error: { code: error.code, message: error.message } })
+        return
+      }
       if (error instanceof JobNotFoundError) {
         this.json(res, 404, { error: { code: error.code, message: error.message } })
         return
@@ -133,6 +192,38 @@ export class ControlPlane {
       return
     }
     const body = (await this.readBody(req)) as CreateJobRequestBody
+
+    // Business-layer admission pipeline (when wired). This replaces the thin
+    // idempotency+create path with authenticate→authorize→policy→quota→create,
+    // preserving the same idempotency semantics (same tenant + key ⇒ same job).
+    if (this.admission && this.business) {
+      const resolved = await this.resolvePrincipal(req, principal)
+      if (!resolved) {
+        this.json(res, 401, { error: { code: "UNAUTHENTICATED", message: "principal could not be resolved" } })
+        return
+      }
+      const spec = body.spec ?? {}
+      const requestedTools = (body.policy?.allowedTools as readonly string[] | undefined) ?? []
+      const admissionReq: AdmissionRequest = {
+        principal: resolved,
+        idempotencyKey: key,
+        orgId: principal.orgId,
+        projectId: principal.projectId === "*" ? body.projectId ?? "default" : principal.projectId,
+        spec: {
+          engine: spec.engine ?? "script",
+          model: spec.model ?? "unknown",
+          ...(typeof spec.input === "string" ? { input: spec.input } : { input: "" }),
+          ...(spec.engineOptions ? { engineOptions: spec.engineOptions } : {}),
+        },
+        requestedTools,
+        ...(body.policy?.maxSteps !== undefined ? { requestedMaxSteps: body.policy.maxSteps } : {}),
+      }
+      const result = await this.admission.admit(admissionReq)
+      this.json(res, result.replayed ? 200 : 201, { id: result.jobId, reservationId: result.reservationId, status: result.status })
+      return
+    }
+
+    // Legacy thin-façade path (no business layer).
     const existing = await this.idempotency.lookup(principal.tenantId, key)
     if (existing) {
       const reused = await this.runner.getJob(existing)
@@ -229,6 +320,120 @@ export class ControlPlane {
       // remains queryable through GET /jobs/:id or GET /jobs/:id/usage.
     }
     res.end()
+  }
+
+  // -------------------------------------------------------------------------
+  // Business-layer read handlers
+  // -------------------------------------------------------------------------
+
+  /** Resolve the authenticated principal into the business-layer identity. When
+   *  an API-key authenticator is configured, it maps the bearer secret to a
+   *  ResolvedPrincipal; otherwise the synthetic header principal is wrapped. */
+  private async resolvePrincipal(_req: IncomingMessage, authn: AuthnPrincipal): Promise<ResolvedPrincipal | null> {
+    if (!this.business) return null
+    if (this.business.apiKeyAuthenticator) {
+      const auth = _req.headers["authorization"]
+      const token = typeof auth === "string" && auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : null
+      if (!token) return null
+      return this.business.apiKeyAuthenticator(token)
+    }
+    return {
+      principalId: `authn:${authn.tenantId}:${authn.orgId}`,
+      tenantId: authn.tenantId,
+      orgId: authn.orgId,
+      role: "admin",
+      kind: "service_account",
+      projectScope: ["*"],
+      admin: authn.admin,
+    }
+  }
+
+  /** Tenant/org scoping for read handlers: the orgId in the URL must match the
+   *  authenticated principal's tenant. Cross-tenant reads return 404. */
+  private scopeTenant(principal: AuthnPrincipal, orgId: string): boolean {
+    return principal.admin || orgId === principal.orgId || principal.orgId === "*"
+  }
+
+  private async listOrganizations(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const orgs = await this.business.identity.listOrganizations(principal.tenantId)
+    this.json(res, 200, { organizations: orgs })
+  }
+
+  private async listProjects(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const orgId = params.orgId!
+    if (!this.scopeTenant(principal, orgId) && !principal.admin) return this.notFound(res)
+    const projects = await this.business.identity.listProjects(principal.tenantId, orgId)
+    this.json(res, 200, { projects })
+  }
+
+  private async listQuotas(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const orgId = params.orgId!
+    if (!this.scopeTenant(principal, orgId) && !principal.admin) return this.notFound(res)
+    const reservations = await this.business.quota.listReservations({ tenantId: principal.tenantId, orgId, projectId: "*" })
+    this.json(res, 200, { reservations })
+  }
+
+  private async listProjectQuotas(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const { orgId, projectId } = params
+    if (!this.scopeTenant(principal, orgId!) && !principal.admin) return this.notFound(res)
+    const reservations = await this.business.quota.listReservations({ tenantId: principal.tenantId, orgId: orgId!, projectId: projectId! })
+    this.json(res, 200, { reservations })
+  }
+
+  private async getScopeUsage(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const orgId = params.orgId!
+    if (!this.scopeTenant(principal, orgId) && !principal.admin) return this.notFound(res)
+    const aggregate = await this.business.metering.aggregateScope({ tenantId: principal.tenantId, orgId, projectId: "*" })
+    this.json(res, 200, { usage: aggregate })
+  }
+
+  private async getProjectUsage(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const { orgId, projectId } = params
+    if (!this.scopeTenant(principal, orgId!) && !principal.admin) return this.notFound(res)
+    const aggregate = await this.business.metering.aggregateScope({ tenantId: principal.tenantId, orgId: orgId!, projectId: projectId! })
+    this.json(res, 200, { usage: aggregate })
+  }
+
+  private async getLedger(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const orgId = params.orgId!
+    if (!this.scopeTenant(principal, orgId) && !principal.admin) return this.notFound(res)
+    const entries = await this.business.billing.listEntries({ tenantId: principal.tenantId, orgId, projectId: "*" })
+    const balance = await this.business.billing.getBalance({ tenantId: principal.tenantId, orgId, projectId: "*" })
+    this.json(res, 200, { entries, balance })
+  }
+
+  private async getProjectLedger(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const { orgId, projectId } = params
+    if (!this.scopeTenant(principal, orgId!) && !principal.admin) return this.notFound(res)
+    const entries = await this.business.billing.listEntries({ tenantId: principal.tenantId, orgId: orgId!, projectId: projectId! })
+    const balance = await this.business.billing.getBalance({ tenantId: principal.tenantId, orgId: orgId!, projectId: projectId! })
+    this.json(res, 200, { entries, balance })
+  }
+
+  private async getAudit(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal, query: URLSearchParams): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const orgId = params.orgId!
+    if (!this.scopeTenant(principal, orgId) && !principal.admin) return this.notFound(res)
+    const limit = Math.min(Number(query.get("limit") ?? 1000), 5000)
+    const events = await this.business.audit.list({ tenantId: principal.tenantId, orgId }, limit)
+    this.json(res, 200, { events })
+  }
+
+  private async getProjectAudit(_req: IncomingMessage, res: ServerResponse, params: Record<string, string>, principal: AuthnPrincipal, query: URLSearchParams): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const { orgId, projectId } = params
+    if (!this.scopeTenant(principal, orgId!) && !principal.admin) return this.notFound(res)
+    const limit = Math.min(Number(query.get("limit") ?? 1000), 5000)
+    const events = await this.business.audit.list({ tenantId: principal.tenantId, orgId: orgId!, projectId: projectId! }, limit)
+    this.json(res, 200, { events })
   }
 
   // -------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 {
-  "name": "@vaulltcore/control",
+  "name": "@vaulltcore/metering",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -8,12 +8,7 @@
   },
   "dependencies": {
     "@vaulltcore/runner": "*",
-    "@vaulltcore/identity": "*",
-    "@vaulltcore/policy": "*",
-    "@vaulltcore/quota": "*",
-    "@vaulltcore/metering": "*",
-    "@vaulltcore/billing": "*",
-    "@vaulltcore/audit": "*"
+    "@vaulltcore/store-sql": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

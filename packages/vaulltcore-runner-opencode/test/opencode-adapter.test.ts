@@ -132,7 +132,7 @@ describe("OpenCode engine behind the AgentRunner seam", () => {
 
     await expect(runner1.runJob(record.jobId)).rejects.toThrow(SimulatedCrashError)
     expect(echo1.executions()).toBe(1)
-    await runner1.suspendJob(record.jobId, "simulated worker loss")
+    await runner1.suspendJob(record.jobId, "worker_loss")
 
     const echo2 = echoTool()
     const runner2 = makeRunner(new ScriptModelProvider(turns), [echo2.tool])

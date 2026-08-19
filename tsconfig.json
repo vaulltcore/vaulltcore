@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/vaulltcore-runner" },
+    { "path": "packages/vaulltcore-runner-opencode" },
+    { "path": "packages/vaulltcore-store-sql" },
+    { "path": "packages/vaulltcore-environment-cloud" },
+    { "path": "packages/vaulltcore-control" }
+  ]
+}

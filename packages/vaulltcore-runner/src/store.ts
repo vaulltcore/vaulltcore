@@ -9,6 +9,21 @@
  */
 
 import type { JobCheckpoint, JobEvent, JobRecord, NewJobEvent } from "./contracts"
+import { IdentityMismatchError } from "./errors"
+
+/** Fields frozen at creation: tenant identity and job wiring can never change. */
+export const IMMUTABLE_JOB_FIELDS = ["jobId", "tenantId", "orgId", "projectId", "createdAt", "spec", "env", "policy"] as const
+
+/** Reject any patch that would mutate a frozen field. Shared by every
+ * DurableJobStore implementation so the invariant holds identically
+ * regardless of the persistence backend. */
+export function assertImmutableJobUpdate(jobId: string, record: JobRecord, patch: Partial<JobRecord>): void {
+  for (const key of IMMUTABLE_JOB_FIELDS) {
+    if (key in patch && JSON.stringify(patch[key]) !== JSON.stringify(record[key])) {
+      throw new IdentityMismatchError(jobId, `attempted mutation of immutable field "${key}"`)
+    }
+  }
+}
 
 export interface LeaseGrant {
   readonly attempt: number

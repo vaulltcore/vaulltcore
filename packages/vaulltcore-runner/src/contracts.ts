@@ -402,6 +402,31 @@ export interface ExecutionSnapshot {
 }
 
 /**
+ * Native capabilities of an execution environment (Phase 1C). Everything an
+ * environment cannot do natively must be reported here so the controller can
+ * fall back explicitly — an environment must never pretend that a logical
+ * checkpoint is a compute (VM/sandbox) snapshot.
+ */
+export interface ExecutionCapabilities {
+  /** Compute can be paused without consuming model tokens. */
+  readonly nativeSuspend: boolean
+  /** Environment can capture a real compute snapshot. */
+  readonly nativeSnapshot: boolean
+  /** Environment can materialize compute from a snapshot. */
+  readonly nativeRestore: boolean
+  /** Workspace contents survive worker loss without a snapshot. */
+  readonly durableWorkspace: boolean
+}
+
+/** Environments that predate the capability contract are assumed fully capable. */
+export const FULL_EXECUTION_CAPABILITIES: ExecutionCapabilities = {
+  nativeSuspend: true,
+  nativeSnapshot: true,
+  nativeRestore: true,
+  durableWorkspace: true,
+}
+
+/**
  * Compute/environment seam. A future provider may implement snapshots using VM
  * snapshots, filesystem layers, object storage, containers, or another
  * mechanism. The runner never depends on the ambient cwd: environment identity
@@ -409,12 +434,20 @@ export interface ExecutionSnapshot {
  */
 export interface ExecutionEnvironment {
   readonly environmentVersion: string
+  /** Native capability report (Phase 1C). Optional for backward compatibility;
+   * absent ⇒ treated as {@link FULL_EXECUTION_CAPABILITIES}. */
+  capabilities?(): ExecutionCapabilities | Promise<ExecutionCapabilities>
   /** Create (or reattach to) the job's execution environment. */
   create(jobId: string): Promise<WorkspaceHandle>
   /** Current workspace identity of a handle. */
   getState(handle: WorkspaceHandle): Promise<WorkspaceState>
-  /** Capture a suspendable snapshot + integrity metadata. */
-  snapshot(handle: WorkspaceHandle, meta: { jobId: string; attempt: number; engineVersion: string }): Promise<ExecutionSnapshot>
+  /**
+   * Capture a suspendable snapshot + integrity metadata. Returns null when no
+   * native snapshot could be captured — an explicit "not captured" result, so
+   * the controller records nothing and the durable checkpoint remains the
+   * only continuation source.
+   */
+  snapshot(handle: WorkspaceHandle, meta: { jobId: string; attempt: number; engineVersion: string }): Promise<ExecutionSnapshot | null>
   /** Materialize an environment from a snapshot (validates job binding + integrity). */
   restore(snapshot: ExecutionSnapshot): Promise<WorkspaceHandle>
   /** Suspend compute (optimization hook; no model tokens may be consumed). */
@@ -547,12 +580,29 @@ export interface CreateJobInput extends JobIdentity {
 
 export interface JobState {
   readonly jobId: string
+  /** Immutable tenant identity (Phase 1C: lets facades authorize without
+   * trusting request-supplied identity claims). */
+  readonly identity: JobIdentity
   readonly status: JobStatus
   readonly attempt: number
   readonly lastEventSeq: number
   readonly usage: JobMetrics
   readonly error: string | null
   readonly checkpoint: JobCheckpoint | null
+}
+
+/** Resource-style read model assembled by the runner (used by the control
+ * plane). Status + usage + admitted-but-pending input + immutable identity. */
+export interface JobView {
+  readonly id: string
+  readonly tenantId: string
+  readonly orgId: string | null
+  readonly projectId: string | null
+  readonly status: JobStatus
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly usage: JobMetrics
+  readonly pendingInput: readonly string[]
 }
 
 export interface AgentRunner {
@@ -573,8 +623,14 @@ export interface AgentRunner {
    * effect at the next step boundary, never mid-turn. */
   submitInput(jobId: string, text: string): Promise<JobState>
   getJobState(jobId: string): Promise<JobState>
+  /** Assembled resource view (identity + status + usage + pending input).
+   * Used by the control plane for read endpoints. Null when unknown. */
+  getJob(jobId: string): Promise<JobView | null>
   /** Replay events with seq > afterSeq, then follow live events until the
    * job reaches a terminal state or the signal aborts. */
   streamEvents(jobId: string, afterSeq?: number, signal?: AbortSignal): AsyncIterable<JobEvent>
+  /** Non-following replay: all committed events with seq > afterSeq. Used by
+   * the control plane for follow=false event reads. */
+  listEvents(jobId: string, afterSeq?: number): Promise<JobEvent[]>
   collectUsage(jobId: string): Promise<JobMetrics>
 }

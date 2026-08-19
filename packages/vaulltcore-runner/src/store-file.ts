@@ -18,11 +18,8 @@ import { mkdir, open, readFile, rename, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import type { JobCheckpoint, JobEvent, JobRecord, NewJobEvent } from "./contracts"
-import { IdentityMismatchError, JobNotFoundError, LeaseFencedError, VaulltcoreError } from "./errors"
-import type { DurableJobStore, LeaseGrant } from "./store"
-
-/** Fields frozen at creation: tenant identity and job wiring can never change. */
-const IMMUTABLE_FIELDS = ["jobId", "tenantId", "orgId", "projectId", "createdAt", "spec", "env", "policy"] as const
+import { JobNotFoundError, LeaseFencedError, VaulltcoreError } from "./errors"
+import { assertImmutableJobUpdate, type DurableJobStore, type LeaseGrant } from "./store"
 
 class Mutex {
   private tail: Promise<void> = Promise.resolve()
@@ -105,11 +102,7 @@ export class FileJobStore implements DurableJobStore {
       const file = await this.readJobFile(jobId)
       if (file.record.attempt !== expectedAttempt) throw new LeaseFencedError(jobId)
       const patch = mutate(file.record)
-      for (const key of IMMUTABLE_FIELDS) {
-        if (key in patch && JSON.stringify(patch[key]) !== JSON.stringify(file.record[key])) {
-          throw new IdentityMismatchError(jobId, `attempted mutation of immutable field "${key}"`)
-        }
-      }
+      assertImmutableJobUpdate(jobId, file.record, patch)
       const next: JobRecord = { ...file.record, ...patch, updatedAt: Date.now() }
       await this.writeJobFile(jobId, { ...file, record: next })
       return next

@@ -14,9 +14,12 @@ import {
   AgentEngine,
   ActorHandle,
   ExecutionActorController,
+  ExecutionCapabilities,
   ExecutionEnvironment,
   ExecutionPolicy,
   ExecutionSnapshot,
+  FULL_EXECUTION_CAPABILITIES,
+  JobCheckpoint,
   JobRecord,
   JobState,
   JobStatus,
@@ -30,6 +33,7 @@ import { newLeaseToken } from "./ids"
 import { validateCheckpoint } from "./checkpoint"
 import { SimulatedCrashError } from "./engine"
 import { InvalidJobStateError, JobNotFoundError, VaulltcoreError } from "./errors"
+import type { SnapshotFacts, SnapshotPolicy } from "./snapshot-policy"
 import type { OwnershipGrant } from "./contracts"
 import type { DurableJobStore } from "./store"
 
@@ -41,6 +45,13 @@ export interface ActorControllerDeps {
   readonly resolveEngine: (record: JobRecord) => AgentEngine
   readonly resolvePolicy: (record: JobRecord) => ExecutionPolicy
   readonly toJobState: (record: JobRecord) => Promise<JobState>
+  /**
+   * Phase 1C cost-aware snapshot policy (optional). Consulted at suspension
+   * boundaries only; advisory — checkpoint durability is never affected by
+   * any decision. When absent, environments snapshot on every suspend
+   * (Phase 1B behavior) as long as they report native snapshot capability.
+   */
+  readonly snapshotPolicy?: SnapshotPolicy
 }
 
 export class ExecutionActorControllerImpl implements ExecutionActorController {
@@ -80,25 +91,71 @@ export class ExecutionActorControllerImpl implements ExecutionActorController {
     if (this.deps.environment) {
       // Reattach to the job-bound workspace deterministically (fresh process
       // suspending a dead worker's job finds the same bound directory).
-      const workspace = await this.deps.environment.create(handle.jobId)
-      snapshot = await this.deps.environment.snapshot(workspace, {
-        jobId: handle.jobId,
-        attempt: record.attempt,
-        engineVersion: this.deps.resolveEngine(record).version,
-      })
-      // Persist the reference durably BEFORE parking the job.
-      await this.deps.store.updateJobRecord(handle.jobId, record.attempt, () => ({ latestSnapshot: snapshot }))
-      await this.deps.environment.suspend(workspace)
+      const environment = this.deps.environment
+      const workspace = await environment.create(handle.jobId)
+      const capabilities = await this.capabilitiesOf(environment)
+
+      // Cost-aware capture decision (Phase 1C). Advisory only: the durable
+      // checkpoint written at commit boundaries is unaffected either way.
+      const decision = this.deps.snapshotPolicy
+        ? this.deps.snapshotPolicy.decide(
+            this.snapshotFacts(record, await this.deps.store.getCheckpoint(handle.jobId), capabilities, reason),
+          )
+        : null
+      if (decision) {
+        await this.deps.store.appendEvents(
+          handle.jobId,
+          [
+            {
+              jobId: handle.jobId,
+              timestamp: Date.now(),
+              type: "warning",
+              data: { reason: "snapshot_decision", detail: decision.reason, decision: decision.decision },
+            },
+          ],
+          record.attempt,
+        )
+      }
+
+      const capture = decision ? decision.decision === "snapshot_now" : capabilities.nativeSnapshot
+      if (capture) {
+        snapshot = await environment.snapshot(workspace, {
+          jobId: handle.jobId,
+          attempt: record.attempt,
+          engineVersion: this.deps.resolveEngine(record).version,
+        })
+        if (snapshot) {
+          // Persist the reference durably BEFORE parking the job.
+          await this.deps.store.updateJobRecord(handle.jobId, record.attempt, () => ({ latestSnapshot: snapshot }))
+        } else {
+          await this.reportSnapshotUnsupported(handle.jobId, record.attempt, "environment returned no snapshot (explicit unsupported capture)")
+        }
+      } else if (!decision) {
+        // No policy configured but the environment declared no native
+        // snapshot capability: explicit fallback, never pretend.
+        await this.reportSnapshotUnsupported(handle.jobId, record.attempt, "environment reports no native snapshot capability")
+      }
+      if (!capabilities.nativeSuspend) {
+        throw new VaulltcoreError(
+          "CAPABILITY_UNSUPPORTED",
+          `Environment ${environment.environmentVersion} cannot natively suspend; compute left running for job ${handle.jobId}`,
+        )
+      }
+      await environment.suspend(workspace)
     }
 
-    await this.deps.store.appendEvents(handle.jobId, [
-      {
-        jobId: handle.jobId,
-        timestamp: Date.now(),
-        type: "warning",
-        data: { reason: "suspended", detail: reason, snapshotId: snapshot?.snapshotId ?? null },
-      },
-    ])
+    await this.deps.store.appendEvents(
+      handle.jobId,
+      [
+        {
+          jobId: handle.jobId,
+          timestamp: Date.now(),
+          type: "warning",
+          data: { reason: "suspended", detail: reason, snapshotId: snapshot?.snapshotId ?? null },
+        },
+      ],
+      record.attempt,
+    )
     const next = await this.deps.store.updateJobRecord(handle.jobId, record.attempt, () => ({
       status: "suspended" as JobStatus,
       leaseToken: null,
@@ -264,6 +321,8 @@ export class ExecutionActorControllerImpl implements ExecutionActorController {
       attempt: handle.ownership.generation,
       engineVersion,
     })
+    // Explicit unsupported/fallback result: nothing captured, nothing recorded.
+    if (!snapshot) return null
     await this.deps.store.updateJobRecord(handle.jobId, handle.ownership.generation, () => ({ latestSnapshot: snapshot }))
     return snapshot
   }
@@ -310,5 +369,39 @@ export class ExecutionActorControllerImpl implements ExecutionActorController {
     const record = await this.deps.store.getJobRecord(jobId)
     if (!record) throw new JobNotFoundError(jobId)
     return record
+  }
+
+  /** Capability report of an environment, defaulting to fully capable. */
+  private async capabilitiesOf(environment: ExecutionEnvironment): Promise<ExecutionCapabilities> {
+    return (await environment.capabilities?.()) ?? FULL_EXECUTION_CAPABILITIES
+  }
+
+  /** Facts derivable from durable state at a suspension boundary. Workspace
+   * size and previous capture cost/duration are not known at this integration
+   * point (providers do not report them yet), so they are null/zero. */
+  private snapshotFacts(
+    record: JobRecord,
+    checkpoint: JobCheckpoint | null,
+    capabilities: ExecutionCapabilities,
+    reason: SuspensionReason,
+  ): SnapshotFacts {
+    const hasSnapshot = record.latestSnapshot !== null
+    return {
+      elapsedMs: Date.now() - record.createdAt,
+      stepsSinceLastSnapshot: hasSnapshot ? 0 : (checkpoint?.usage.steps ?? 0),
+      cumulativeTokens: checkpoint?.usage.totalTokens ?? 0,
+      workspaceBytes: null,
+      lastSnapshot: hasSnapshot ? { durationMs: 0, costUsd: 0 } : null,
+      capabilities,
+      suspensionRisk: reason === "infrastructure_eviction" ? "high" : "none",
+    }
+  }
+
+  private async reportSnapshotUnsupported(jobId: string, attempt: number, detail: string): Promise<void> {
+    await this.deps.store.appendEvents(
+      jobId,
+      [{ jobId, timestamp: Date.now(), type: "warning", data: { reason: "snapshot_unsupported", detail } }],
+      attempt,
+    )
   }
 }

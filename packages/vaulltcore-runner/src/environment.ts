@@ -14,7 +14,7 @@ import { createHash } from "node:crypto"
 import { cp, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { ExecutionEnvironment, ExecutionSnapshot, WorkspaceHandle, WorkspaceState } from "./contracts"
+import { ExecutionCapabilities, ExecutionEnvironment, ExecutionSnapshot, WorkspaceHandle, WorkspaceState } from "./contracts"
 import { newSnapshotId } from "./ids"
 
 const SNAPSHOT_ROOT = "snapshots"
@@ -32,6 +32,12 @@ export class LocalExecutionEnvironment implements ExecutionEnvironment {
     private readonly baseDir?: string,
     private readonly hooks: EnvironmentHooks = {},
   ) {}
+
+  /** Local FS can capture/restore real directory snapshots and the workspace
+   * survives this host's worker restarts, so everything is native. */
+  capabilities(): ExecutionCapabilities {
+    return { nativeSuspend: true, nativeSnapshot: true, nativeRestore: true, durableWorkspace: true }
+  }
 
   private base(): string {
     return this.baseDir ?? tmpdir()

@@ -33,6 +33,7 @@ import type {
   JobRecord,
   JobState,
   JobStatus,
+  JobView,
   NewJobEvent,
   RecoveryContext,
   SuspensionReason,
@@ -53,6 +54,7 @@ import {
   VaulltcoreError,
 } from "./errors"
 import { newExecutionId, newJobId, newLeaseToken } from "./ids"
+import type { SnapshotPolicy } from "./snapshot-policy"
 import type { DurableJobStore } from "./store"
 import { envForJob } from "./workspace"
 
@@ -66,6 +68,8 @@ export interface RunnerDeps {
    * supersedes `workspace` for environment materialization and snapshots.
    */
   readonly environment?: ExecutionEnvironment | null
+  /** Phase 1C cost-aware snapshot policy (optional, advisory only). */
+  readonly snapshotPolicy?: SnapshotPolicy
 }
 
 /** Mutable checkpoint draft; finalized (checksummed) at every boundary. */
@@ -103,6 +107,7 @@ export class DurableAgentRunner implements AgentRunner {
       resolveEngine: (record) => this.engineFor(record),
       resolvePolicy: (record) => this.policyFor(record),
       toJobState: (record) => this.toState(record),
+      ...(deps.snapshotPolicy ? { snapshotPolicy: deps.snapshotPolicy } : {}),
     })
   }
 
@@ -270,6 +275,41 @@ export class DurableAgentRunner implements AgentRunner {
   async getJobState(jobId: string): Promise<JobState> {
     const record = await this.requireRecord(jobId)
     return this.toState(record)
+  }
+
+  /** Control-plane read seam (Phase 1C): a resource-style view assembled from
+   * the durable record, checkpoint usage, and admitted-but-pending input.
+   * Returns null for unknown ids instead of throwing. */
+  async getJob(jobId: string): Promise<JobView | null> {
+    const record = await this.store.getJobRecord(jobId).catch(() => null)
+    if (!record) return null
+    const events = await this.store.listEvents(jobId)
+    const checkpoint = await this.store.getCheckpoint(jobId)
+    const watermark = checkpoint?.lastEventSeq ?? 0
+    const pending = [...(checkpoint?.pendingInput ?? [])]
+    for (const event of events) {
+      if (event.type === "message" && event.seq > watermark) {
+        const data = event.data as { role?: string; admitted?: boolean; text?: string }
+        if (data.role === "user" && data.admitted && data.text) pending.push(data.text)
+      }
+    }
+    return {
+      id: record.jobId,
+      tenantId: record.tenantId,
+      orgId: record.orgId,
+      projectId: record.projectId,
+      status: record.status,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+      usage: checkpoint?.usage ?? emptyMetrics(),
+      pendingInput: pending,
+    }
+  }
+
+  /** Non-following replay (Phase 1C control-plane read seam). */
+  async listEvents(jobId: string, afterSeq = 0): Promise<JobEvent[]> {
+    await this.requireRecord(jobId)
+    return this.store.listEvents(jobId, afterSeq)
   }
 
   async collectUsage(jobId: string): Promise<JobMetrics> {
@@ -804,6 +844,7 @@ export class DurableAgentRunner implements AgentRunner {
     if (lastEventSeq === 0) lastEventSeq = (await this.store.listEvents(record.jobId)).length
     return {
       jobId: record.jobId,
+      identity: this.identityOf(record),
       status: record.status,
       attempt: record.attempt,
       lastEventSeq,

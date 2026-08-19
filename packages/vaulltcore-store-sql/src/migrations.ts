@@ -44,22 +44,22 @@ export const MIGRATIONS: readonly Migration[] = [
         env              TEXT NOT NULL,
         policy           TEXT NOT NULL,
         latest_snapshot  TEXT,
-        last_seq         INTEGER NOT NULL DEFAULT 0,
-        created_at       INTEGER NOT NULL,
-        updated_at       INTEGER NOT NULL
+        last_seq         BIGINT NOT NULL DEFAULT 0,
+        created_at       BIGINT NOT NULL,
+        updated_at       BIGINT NOT NULL
       )`,
       `CREATE INDEX jobs_tenant_idx ON jobs (tenant_id, org_id, project_id)`,
       `CREATE TABLE job_leases (
         job_id      TEXT PRIMARY KEY REFERENCES jobs (job_id) ON DELETE CASCADE,
         token       TEXT NOT NULL,
         generation  INTEGER NOT NULL,
-        expires_at  INTEGER NOT NULL,
-        acquired_at INTEGER NOT NULL
+        expires_at  BIGINT NOT NULL,
+        acquired_at BIGINT NOT NULL
       )`,
       `CREATE TABLE job_events (
         job_id    TEXT NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
-        seq       INTEGER NOT NULL,
-        timestamp INTEGER NOT NULL,
+        seq       BIGINT NOT NULL,
+        timestamp BIGINT NOT NULL,
         type      TEXT NOT NULL,
         data      TEXT NOT NULL,
         PRIMARY KEY (job_id, seq)
@@ -67,17 +67,84 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE TABLE job_checkpoints (
         job_id         TEXT PRIMARY KEY REFERENCES jobs (job_id) ON DELETE CASCADE,
         checkpoint     TEXT NOT NULL,
-        last_event_seq INTEGER NOT NULL,
+        last_event_seq BIGINT NOT NULL,
         attempt        INTEGER NOT NULL,
-        updated_at     INTEGER NOT NULL
+        updated_at     BIGINT NOT NULL
       )`,
       `CREATE TABLE job_snapshots (
         job_id      TEXT NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
         snapshot_id TEXT NOT NULL,
         snapshot    TEXT NOT NULL,
-        created_at  INTEGER NOT NULL,
+        created_at  BIGINT NOT NULL,
         PRIMARY KEY (job_id, snapshot_id)
       )`,
+    ],
+  },
+  {
+    version: 2,
+    name: "distributed_control_plane",
+    statements: [
+      // Durable idempotency for POST /jobs. UNIQUE(tenant_id, idempotency_key)
+      // is the linearization point: concurrent create attempts serialize here.
+      // Different tenants may use identical keys without collision.
+      `CREATE TABLE idempotency_records (
+        tenant_id       TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_hash    TEXT NOT NULL,
+        job_id          TEXT,
+        response_status INTEGER,
+        response_body   TEXT,
+        created_at      BIGINT NOT NULL,
+        expires_at      BIGINT,
+        PRIMARY KEY (tenant_id, idempotency_key)
+      )`,
+      `CREATE INDEX idempotency_job_idx ON idempotency_records (job_id)`,
+      // Worker registry + heartbeats (supervisor/reconciler input).
+      `CREATE TABLE workers (
+        worker_id     TEXT PRIMARY KEY,
+        boot_token    TEXT NOT NULL,
+        label         TEXT,
+        status        TEXT NOT NULL DEFAULT 'active',
+        last_seen_at  BIGINT NOT NULL,
+        created_at    BIGINT NOT NULL
+      )`,
+      `CREATE TABLE worker_heartbeats (
+        worker_id    TEXT NOT NULL,
+        at           BIGINT NOT NULL,
+        active_jobs   TEXT NOT NULL,
+        PRIMARY KEY (worker_id, at)
+      )`,
+      // Dispatch claims: at most one outstanding claim per job (PRIMARY KEY on
+      // job_id). The claim carries the fenced generation/token the worker must
+      // present on every mutation.
+      `CREATE TABLE dispatch_claims (
+        job_id      TEXT PRIMARY KEY REFERENCES jobs (job_id) ON DELETE CASCADE,
+        worker_id   TEXT NOT NULL,
+        boot_token  TEXT NOT NULL,
+        generation  INTEGER NOT NULL,
+        token       TEXT NOT NULL,
+        expires_at  BIGINT NOT NULL,
+        claimed_at  BIGINT NOT NULL,
+        acknowledged INTEGER NOT NULL DEFAULT 0
+      )`,
+      // Snapshot lifecycle registry. A snapshot is an optimization; the
+      // checkpoint + event log stay authoritative. GC never deletes the last
+      // valid recovery artifact before its replacement is durably committed.
+      `CREATE TABLE snapshot_lifecycle (
+        snapshot_id    TEXT PRIMARY KEY,
+        tenant_id       TEXT NOT NULL,
+        job_id          TEXT NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
+        provider        TEXT NOT NULL,
+        size_bytes      BIGINT,
+        integrity_hash  TEXT NOT NULL,
+        attempt         INTEGER NOT NULL,
+        state           TEXT NOT NULL,
+        superseded_by   TEXT,
+        created_at      BIGINT NOT NULL,
+        expires_at      BIGINT,
+        updated_at      BIGINT NOT NULL
+      )`,
+      `CREATE INDEX snapshot_lifecycle_job_idx ON snapshot_lifecycle (job_id, state)`,
     ],
   },
 ]
@@ -85,7 +152,7 @@ export const MIGRATIONS: readonly Migration[] = [
 const LEDGER = `CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
-  applied_at INTEGER NOT NULL
+  applied_at BIGINT NOT NULL
 )`
 
 /** Apply pending migrations in version order. Returns applied versions.

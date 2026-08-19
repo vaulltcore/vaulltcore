@@ -36,3 +36,8 @@ export const newExecutionId = (): string => "exe_" + ascending()
 export const newLeaseToken = (): string => "lease_" + ascending()
 export const newWorkspaceId = (): string => "wks_" + ascending()
 export const newSnapshotId = (): string => "snap_" + ascending()
+/** Random suffix of `len` chars from the base62 alphabet (Phase 1D worker ids). */
+export const randomId = (len = 12): string =>
+  Array.from(crypto.getRandomValues(new Uint8Array(len)), (byte) => chars[byte % 62]).join("")
+export const newWorkerId = (): string => "wk_" + ascending()
+export const newBootToken = (): string => "bt_" + ascending()

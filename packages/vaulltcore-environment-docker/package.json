@@ -1,19 +1,15 @@
 {
-  "name": "@vaulltcore/store-sql",
+  "name": "@vaulltcore/environment-docker",
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "exports": {
-    ".": "./src/index.ts"
-  },
+  "exports": { ".": "./src/index.ts" },
   "dependencies": {
     "@vaulltcore/runner": "*",
-    "pg": "^8.13.0"
-  },
-  "devDependencies": {
-    "@types/pg": "^8.11.0"
+    "@vaulltcore/environment-cloud": "*"
   },
   "scripts": {
+    "test": "vitest run",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   }
 }

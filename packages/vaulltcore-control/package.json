@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "@vaulltcore/runner": "*",
+    "@vaulltcore/store-sql": "*",
+    "@vaulltcore/worker": "*",
     "@vaulltcore/identity": "*",
     "@vaulltcore/policy": "*",
     "@vaulltcore/quota": "*",

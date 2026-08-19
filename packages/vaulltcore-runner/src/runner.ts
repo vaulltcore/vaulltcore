@@ -54,6 +54,7 @@ import {
   VaulltcoreError,
 } from "./errors"
 import { newExecutionId, newJobId, newLeaseToken } from "./ids"
+import type { LeaseRenewalResult } from "./distributed"
 import type { SnapshotPolicy } from "./snapshot-policy"
 import type { DurableJobStore } from "./store"
 import { envForJob } from "./workspace"
@@ -246,6 +247,13 @@ export class DurableAgentRunner implements AgentRunner {
       return this.finalizeCancelled(next, null, null)
     }
     return this.toState(next)
+  }
+
+  async renewLease(jobId: string, leaseMs: number): Promise<LeaseRenewalResult> {
+    const run = this.active.get(jobId)
+    if (!run) return { renewed: false, reason: "not_found" }
+    if (!this.store.renewLease) return { renewed: false, reason: "not_found" }
+    return this.store.renewLease(jobId, run.leaseToken, leaseMs)
   }
 
   async suspendJob(jobId: string, reason: SuspensionReason = "worker_loss"): Promise<JobState> {

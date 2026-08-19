@@ -11,8 +11,13 @@
     "typecheck": "tsc --build packages/*"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.5",
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
   }
 }

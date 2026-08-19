@@ -41,6 +41,7 @@ import {
   type LeaseGrant,
   type NewJobEvent,
 } from "@vaulltcore/runner"
+import type { LeaseRenewalResult } from "@vaulltcore/runner"
 import { applyMigrations } from "./migrations"
 import { sqliteDialect, type SqlDatabase, type SqlDialect, type SqlStatement } from "./driver"
 
@@ -309,6 +310,26 @@ export class SqlJobStore implements DurableJobStore {
       if (!lease || lease.token !== leaseToken) return
       // Token in the WHERE clause as defense in depth.
       this.prepare("DELETE FROM job_leases WHERE job_id = ? AND token = ?").run(jobId, leaseToken)
+    })
+  }
+
+  /** Fenced lease renewal (heartbeat durability path). A stale token can never
+   * renew a lease held by a newer generation; this returns a fenced result
+   * instead of throwing so the supervisor can classify expiry deterministically. */
+  async renewLease(jobId: string, leaseToken: string, leaseMs: number): Promise<LeaseRenewalResult> {
+    return this.atomic("renewLease", () => {
+      const row = this.readRow(jobId)
+      const lease = this.readLease(jobId)
+      if (!lease) return { renewed: false as const, reason: "not_found" as const }
+      if (lease.token !== leaseToken) return { renewed: false as const, reason: "fenced" as const }
+      const now = Date.now()
+      if (lease.expires_at <= now) return { renewed: false as const, reason: "expired" as const, expiresAt: lease.expires_at }
+      const expiresAt = now + leaseMs
+      // CAS on token: defense in depth under cross-connection contention.
+      const result = this.prepare("UPDATE job_leases SET expires_at = ? WHERE job_id = ? AND token = ?").run(expiresAt, jobId, leaseToken)
+      if (result.changes === 0) return { renewed: false as const, reason: "fenced" as const }
+      void row
+      return { renewed: true as const, expiresAt }
     })
   }
 

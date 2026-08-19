@@ -8,6 +8,8 @@
  * No runtime dependencies. Plain types + hand-rolled validation only.
  */
 
+import type { LeaseRenewalResult } from "./distributed"
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -611,6 +613,14 @@ export interface AgentRunner {
   runJob(jobId: string): Promise<JobState>
   /** Resume a suspended/interrupted job from its durable continuation point. */
   resumeJob(jobId: string): Promise<JobState>
+  /**
+   * Phase 1D: fenced heartbeat renewal of the execution lease for an
+   * actively-running job the caller owns. Uses the lease token tracked for
+   * the active run; a stale owner (token mismatched by a newer generation) is
+   * rejected — it can never reclaim authority. Returns the store's renewal
+   * result; `renewed:false` means the worker has lost ownership and must stop.
+   */
+  renewLease(jobId: string, leaseMs: number): Promise<LeaseRenewalResult>
   /** Request cancellation. Durable; effective at the next commit boundary. */
   cancelJob(jobId: string): Promise<JobState>
   /**

@@ -1,16 +1,45 @@
-## Hi there 👋
+# Vaulltcore
 
-<!--
-**vaulltcore/vaulltcore** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+B2B AI Engineering Automation platform. This repository currently contains the Phase 1A
+execution foundation: a durable, resumable job runner with the OpenCode-derived agent
+engine behind a replaceable seam. See [docs/phase1a.md](docs/phase1a.md) for the full
+architecture report.
 
-Here are some ideas to get you started:
+## Layout
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+- `packages/vaulltcore-runner` — neutral `AgentRunner` contract, durable state machine,
+  checkpoints, append-only event log, workspace seam, tool/policy seam.
+- `packages/vaulltcore-runner-opencode` — extracted OpenCode kernel + `AgentEngine`
+  adapter (model boundary, event normalization).
+
+## Commands
+
+```bash
+npm install
+npm test          # vitest, 19 tests
+npm run typecheck # tsc --build
+```
+
+## Brief example
+
+```ts
+import { DurableAgentRunner, FileJobStore, ScriptEngine } from "@vaulltcore/runner"
+
+const runner = new DurableAgentRunner({
+  store: new FileJobStore(".vaulltcore"),
+  engines: [new ScriptEngine([{ text: "hello" }])],
+  tools: [],
+  workspace: null,
+})
+
+const job = await runner.createJob({
+  tenantId: "t", orgId: "o", projectId: "p",
+  spec: { engine: "script", model: "m", input: "do work" },
+})
+const state = await runner.runJob(job.jobId) // resumes safely if the worker crashed
+```
+
+## Attribution
+
+Minimal code extracted from [opencode](https://github.com/anomalyco/opencode) (MIT
+License, Copyright (c) 2025 opencode) — see `NOTICE.md` and per-file headers.

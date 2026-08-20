@@ -93,6 +93,26 @@ export const QUOTA_MIGRATIONS: readonly Migration[] = [
       )`,
     ],
   },
+  // Phase 2E: tenant-safe backpressure + fairness — a global capacity ceiling
+  // so one tenant cannot exhaust shared execution capacity. Globally unique
+  // migration name (dedup-by-name rule). The per-scope in_use counter already
+  // enforces the per-tenant ceiling (Phase 1E); this adds a single global row
+  // that bounds the sum across all tenants. A reservation that fits the
+  // per-scope ceiling but exceeds the global ceiling is rejected honestly
+  // (QUOTA_GLOBAL_FULL) — work is queued/admitted state, never silently dropped.
+  {
+    version: 5,
+    name: "quota_global_capacity",
+    statements: [
+      `CREATE TABLE IF NOT EXISTS quota_global_capacity (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        max_concurrent INTEGER NOT NULL DEFAULT 0,
+        in_use INTEGER NOT NULL DEFAULT 0
+      )`,
+      `INSERT INTO quota_global_capacity (id, max_concurrent, in_use) VALUES (1, 0, 0)
+       ON CONFLICT (id) DO NOTHING`,
+    ],
+  },
 ]
 
 interface ReservationRow {
@@ -261,6 +281,27 @@ export class SqlQuotaStore extends SqlStoreBase {
         throw new QuotaError("QUOTA_EXCEEDED", `Concurrent job limit (${limits.maxConcurrentJobs}) reached for ${scope.orgId}/${scope.projectId}`)
       }
 
+      // 4b. Phase 2E: global capacity ceiling (tenant-safe backpressure). A
+      // reservation that fits the per-scope ceiling but exceeds the global
+      // ceiling is rejected honestly — work is never silently dropped. The
+      // per-scope claim is rolled back on global denial. When no global ceiling
+      // is configured (max_concurrent = 0), this is a no-op.
+      const global = this.prepare("SELECT max_concurrent, in_use FROM quota_global_capacity WHERE id = 1").get() as { max_concurrent: number; in_use: number } | undefined
+      if (global && global.max_concurrent > 0) {
+        const globalClaim = this.prepare(
+          "UPDATE quota_global_capacity SET in_use = in_use + 1 WHERE id = 1 AND in_use < ?",
+        ).run(global.max_concurrent)
+        if (globalClaim.changes === 0) {
+          // Roll back the per-scope claim and reject honestly.
+          this.prepare("UPDATE quota_counters SET in_use = in_use - 1 WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND in_use > 0").run(scope.tenantId, scope.orgId, scope.projectId)
+          const rejectedId = id("res")
+          this.prepare(
+            "INSERT INTO quota_reservations (reservation_id, tenant_id, org_id, project_id, request_key, job_id, state, version, created_at, settled_at, released_at, expires_at, settled_tokens, settled_duration_ms, reason_code) VALUES (?, ?, ?, ?, ?, ?, 'rejected', 1, ?, NULL, NULL, ?, NULL, NULL, 'QUOTA_GLOBAL_FULL')",
+          ).run(rejectedId, scope.tenantId, scope.orgId, scope.projectId, requestKey, jobId, now, expiresAt)
+          throw new QuotaError("QUOTA_GLOBAL_FULL", `Global concurrent capacity (${global.max_concurrent}) reached`)
+        }
+      }
+
       // 5. Insert the active reservation. UNIQUE collisions are impossible here
       // (we checked), but defense-in-depth: roll back the claim on collision.
       const reservationId = id("res")
@@ -272,6 +313,9 @@ export class SqlQuotaStore extends SqlStoreBase {
         if (isUniqueViolation(error)) {
           // A concurrent reservation won the request_key race; undo the claim.
           this.prepare("UPDATE quota_counters SET in_use = in_use - 1 WHERE tenant_id = ? AND org_id = ? AND project_id = ?").run(scope.tenantId, scope.orgId, scope.projectId)
+          if (global && global.max_concurrent > 0) {
+            this.prepare("UPDATE quota_global_capacity SET in_use = in_use - 1 WHERE id = 1 AND in_use > 0").run()
+          }
           const winner = this.prepare("SELECT * FROM quota_reservations WHERE tenant_id = ? AND request_key = ?").get(scope.tenantId, requestKey) as unknown as ReservationRow
           return toReservation(winner)
         }
@@ -320,8 +364,9 @@ export class SqlQuotaStore extends SqlStoreBase {
       ).run(now, actual.tokens, actual.durationMs, reservationId, expectedVersion)
       if (result.changes === 0) throw new QuotaError("RESERVATION_FENCED", `Reservation ${reservationId} is owned by a newer version`)
       // Release the unused capacity slot: settlement ends the reservation's
-      // concurrency hold.
+      // concurrency hold (per-scope + global).
       this.prepare("UPDATE quota_counters SET in_use = in_use - 1 WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND in_use > 0").run(row.tenant_id, row.org_id, row.project_id)
+      this.prepare("UPDATE quota_global_capacity SET in_use = in_use - 1 WHERE id = 1 AND in_use > 0").run()
       const updated = this.prepare("SELECT * FROM quota_reservations WHERE reservation_id = ?").get(reservationId) as unknown as ReservationRow
       return toReservation(updated)
     })
@@ -348,6 +393,7 @@ export class SqlQuotaStore extends SqlStoreBase {
       ).run(now, reservationId, expectedVersion)
       if (result.changes === 0) throw new QuotaError("RESERVATION_FENCED", `Reservation ${reservationId} is owned by a newer version`)
       this.prepare("UPDATE quota_counters SET in_use = in_use - 1 WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND in_use > 0").run(row.tenant_id, row.org_id, row.project_id)
+      this.prepare("UPDATE quota_global_capacity SET in_use = in_use - 1 WHERE id = 1 AND in_use > 0").run()
       const updated = this.prepare("SELECT * FROM quota_reservations WHERE reservation_id = ?").get(reservationId) as unknown as ReservationRow
       return toReservation(updated)
     })
@@ -361,7 +407,7 @@ export class SqlQuotaStore extends SqlStoreBase {
    * by the `state = 'active' AND expires_at <= ?` predicate, so renewed or
    * settled work is NEVER reclaimed. Repeated reaper runs produce no
    * double-release: an already-`expired` row no longer matches the predicate.
-   * Capacity is decremented at most once per reservation. */
+   * Capacity is decremented at most once per reservation (per-scope + global). */
   async reapExpired(now: number = Date.now()): Promise<number> {
     return this.atomic("reapExpired", () => {
       const expired = this.prepare("SELECT reservation_id, tenant_id, org_id, project_id FROM quota_reservations WHERE state = 'active' AND expires_at <= ?").all(now) as Array<{
@@ -373,6 +419,7 @@ export class SqlQuotaStore extends SqlStoreBase {
       for (const row of expired) {
         this.prepare("UPDATE quota_reservations SET state = 'expired', released_at = ?, version = version + 1 WHERE reservation_id = ? AND state = 'active'").run(now, row.reservation_id)
         this.prepare("UPDATE quota_counters SET in_use = in_use - 1 WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND in_use > 0").run(row.tenant_id, row.org_id, row.project_id)
+        this.prepare("UPDATE quota_global_capacity SET in_use = in_use - 1 WHERE id = 1 AND in_use > 0").run()
       }
       return expired.length
     })
@@ -417,5 +464,28 @@ export class SqlQuotaStore extends SqlStoreBase {
       "SELECT * FROM quota_reservations WHERE state = 'active' AND expires_at <= ?",
     ).all(now) as unknown as ReservationRow[]
     return rows.map(toReservation)
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2E: global capacity ceiling (tenant-safe backpressure + fairness).
+  // -------------------------------------------------------------------------
+
+  /** Set the global concurrent capacity ceiling. 0 disables the global ceiling
+   *  (per-scope ceilings still apply). This bounds the SUM of in-use capacity
+   *  across all tenants, so one tenant cannot exhaust shared execution
+   *  capacity. A reservation that fits its per-scope ceiling but exceeds the
+   *  global ceiling is rejected honestly (QUOTA_GLOBAL_FULL) — work is queued,
+   *  never silently dropped. */
+  async setGlobalCapacity(maxConcurrent: number): Promise<void> {
+    this.atomic("setGlobalCapacity", () => {
+      this.prepare("UPDATE quota_global_capacity SET max_concurrent = ? WHERE id = 1").run(Math.max(0, Math.floor(maxConcurrent)))
+    })
+  }
+
+  /** Read-only global usage snapshot (advisory; the global counter is the
+   *  source of truth for the global ceiling). */
+  async getGlobalUsage(): Promise<{ maxConcurrent: number; inUse: number }> {
+    const row = this.prepare("SELECT max_concurrent, in_use FROM quota_global_capacity WHERE id = 1").get() as { max_concurrent: number; in_use: number } | undefined
+    return { maxConcurrent: row?.max_concurrent ?? 0, inUse: row?.in_use ?? 0 }
   }
 }

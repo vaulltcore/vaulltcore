@@ -66,6 +66,8 @@ export interface TriggerDispatchServiceOptions {
   readonly audit?: SqlAuditStore
   /** Max attempts before dead-lettering a retryable dispatch. */
   readonly maxAttempts?: number
+  /** Phase 2E: fenced redrive lease duration (ms). Default 60s. */
+  readonly redriveLeaseMs?: number
 }
 
 export interface DispatchEventResult {
@@ -79,12 +81,14 @@ export class TriggerDispatchService {
   private readonly sink: TriggerRunSink
   private readonly audit?: SqlAuditStore
   private readonly maxAttempts: number
+  private readonly redriveLeaseMs: number
 
   constructor(options: TriggerDispatchServiceOptions) {
     this.store = options.store
     this.sink = options.sink
     this.audit = options.audit
     this.maxAttempts = options.maxAttempts ?? 5
+    this.redriveLeaseMs = options.redriveLeaseMs ?? 60_000
   }
 
   /**
@@ -175,18 +179,28 @@ export class TriggerDispatchService {
 
   /**
    * Re-drive non-terminal dispatches (recovery). A crashed dispatch is
-   * re-driven idempotently: the dispatch identity is unique, so re-driving
-   * never creates a duplicate. After maxAttempts, dead-letter honestly.
+   * re-driven under a FENCED lease (Phase 2E): claimRedriveDispatch stamps a
+   * redrive_generation; a stale owner whose generation was superseded cannot
+   * finalize. The dispatch identity is unique, so re-driving never creates a
+   * duplicate dispatch. After maxAttempts, dead-letter honestly. A terminal
+   * dispatch (run_created/rejected/dead_letter) is never claimed — a late retry
+   * cannot resurrect terminal work.
    */
-  async redrive(tenantId: string, limit = 100): Promise<{ driven: number; created: number; failed: number }> {
-    const pending = await this.store.listPending(tenantId, limit)
+  async redrive(tenantId: string, limit = 100, owner = `redrive-${Date.now()}`): Promise<{ driven: number; created: number; failed: number }> {
+    const stranded = await this.store.listStrandedDispatches(tenantId, limit)
     let driven = 0
     let created = 0
     let failed = 0
-    for (const dispatch of pending) {
+    const now = Date.now()
+    for (const dispatch of stranded) {
+      // Claim a fenced redrive lease. A terminal dispatch (concurrently
+      // finalized) returns null — skip it (never resurrect).
+      const lease = await this.store.claimRedriveDispatch(tenantId, dispatch.dispatchId, owner, this.redriveLeaseMs, now)
+      if (!lease) continue
       driven++
       if (dispatch.attempts >= this.maxAttempts) {
         await this.store.deadLetter(tenantId, dispatch.dispatchId, `exhausted ${this.maxAttempts} attempts`)
+        await this.store.releaseRedriveLease(tenantId, dispatch.dispatchId, lease.generation, now)
         await this.auditDispatch(dispatch, "trigger_dead_lettered", { attempts: dispatch.attempts })
         failed++
         continue
@@ -194,6 +208,7 @@ export class TriggerDispatchService {
       const trigger = await this.store.getTrigger(tenantId, dispatch.triggerId)
       if (!trigger) {
         await this.store.markRejected(tenantId, dispatch.dispatchId, "no_trigger", "trigger definition no longer exists")
+        await this.store.releaseRedriveLease(tenantId, dispatch.dispatchId, lease.generation, now)
         failed++
         continue
       }
@@ -216,6 +231,9 @@ export class TriggerDispatchService {
         receivedAt: dispatch.createdAt,
       }
       const runId = await this.driveDispatch(dispatch, trigger, event)
+      // Release the lease (driveDispatch already advanced the state; a terminal
+      // dispatch's lease was cleared by markRunCreated/markRejected).
+      await this.store.releaseRedriveLease(tenantId, dispatch.dispatchId, lease.generation, now)
       if (runId) created++
     }
     return { driven, created, failed }

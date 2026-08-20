@@ -86,6 +86,21 @@ export const TRIGGER_MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX dispatches_event_idx ON automation_trigger_dispatches (tenant_id, source_event_id)`,
     ],
   },
+  // Phase 2E: fenced redrive lease + dead-letter diagnostics for dispatches.
+  // Globally unique migration name (dedup-by-name rule). Adds the durable
+  // redrive lease generation + owner + expiry so a crashed re-drive cannot be
+  // blindly finalized by a stale owner, and a sanitized diagnostic context
+  // column. Additive (new nullable columns; existing rows default to NULL/0).
+  {
+    version: 4,
+    name: "automation_dispatch_lease",
+    statements: [
+      `ALTER TABLE automation_trigger_dispatches ADD COLUMN redrive_generation INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE automation_trigger_dispatches ADD COLUMN redrive_owner TEXT`,
+      `ALTER TABLE automation_trigger_dispatches ADD COLUMN redrive_expires_at BIGINT`,
+      `CREATE INDEX IF NOT EXISTS dispatches_redrive_idx ON automation_trigger_dispatches (tenant_id, state, redrive_expires_at)`,
+    ],
+  },
 ]
 
 /** Dispatch state machine. */
@@ -141,6 +156,9 @@ interface DispatchRow {
   rejection_kind: string | null
   attempts: number
   last_error: string | null
+  redrive_generation: number
+  redrive_owner: string | null
+  redrive_expires_at: number | null
   created_at: number
   updated_at: number
 }
@@ -185,6 +203,9 @@ function toDispatch(row: DispatchRow): TriggerDispatch {
     rejectionKind: row.rejection_kind as DispatchRejectionKind | null,
     attempts: row.attempts,
     lastError: row.last_error,
+    redriveGeneration: row.redrive_generation,
+    redriveOwner: row.redrive_owner,
+    redriveExpiresAt: row.redrive_expires_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -207,6 +228,11 @@ export interface TriggerDispatch {
   rejectionKind: DispatchRejectionKind | null
   attempts: number
   lastError: string | null
+  /** Phase 2E: fenced redrive lease generation. A stale owner (older
+   *  generation) cannot finalize a redrive that a newer generation took over. */
+  redriveGeneration: number
+  redriveOwner: string | null
+  redriveExpiresAt: number | null
   readonly createdAt: number
   updatedAt: number
 }
@@ -409,23 +435,26 @@ export class SqlTriggerStore extends SqlStoreBase {
     return updated
   }
 
-  /** Mark a dispatch run_created (terminal; idempotent). */
+  /** Mark a dispatch run_created (terminal; idempotent). Clears any redrive
+   *  lease so a stale redrive owner cannot later act on a terminal dispatch. */
   async markRunCreated(tenantId: string, dispatchId: string, runId: string): Promise<void> {
     this.atomic("markRunCreated", () => {
-      this.prepare("UPDATE automation_trigger_dispatches SET state = 'run_created', automation_run_id = ?, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state IN ('admitted','dispatching','matched')")
+      this.prepare("UPDATE automation_trigger_dispatches SET state = 'run_created', automation_run_id = ?, redrive_owner = NULL, redrive_expires_at = NULL, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state IN ('admitted','dispatching','matched')")
         .run(runId, Date.now(), dispatchId, tenantId)
     })
   }
 
-  /** Mark a dispatch rejected (terminal; honest classification). */
+  /** Mark a dispatch rejected (terminal; honest classification). Clears the
+   *  redrive lease (terminal work is never resurrected). */
   async markRejected(tenantId: string, dispatchId: string, kind: DispatchRejectionKind, reason: string): Promise<void> {
     this.atomic("markRejected", () => {
-      this.prepare("UPDATE automation_trigger_dispatches SET state = 'rejected', rejection_kind = ?, rejection_reason = ?, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state NOT IN ('run_created','rejected','dead_letter')")
+      this.prepare("UPDATE automation_trigger_dispatches SET state = 'rejected', rejection_kind = ?, rejection_reason = ?, redrive_owner = NULL, redrive_expires_at = NULL, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state NOT IN ('run_created','rejected','dead_letter')")
         .run(kind, reason.slice(0, 500), Date.now(), dispatchId, tenantId)
     })
   }
 
-  /** Mark a retryable failure (re-driveable). */
+  /** Mark a retryable failure (re-driveable). Preserves the redrive lease so
+   *  the active redrive owner keeps authority through the transition. */
   async markRetryable(tenantId: string, dispatchId: string, error: string): Promise<void> {
     this.atomic("markRetryable", () => {
       this.prepare("UPDATE automation_trigger_dispatches SET state = 'retryable_failure', last_error = ?, attempts = attempts + 1, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state NOT IN ('run_created','rejected','dead_letter')")
@@ -433,10 +462,11 @@ export class SqlTriggerStore extends SqlStoreBase {
     })
   }
 
-  /** Dead-letter a dispatch (terminal; exhausted retries). */
+  /** Dead-letter a dispatch (terminal; exhausted retries). Clears the redrive
+   *  lease; operators redrive from dead_letter through redriveDeadLetter. */
   async deadLetter(tenantId: string, dispatchId: string, reason: string): Promise<void> {
     this.atomic("deadLetter", () => {
-      this.prepare("UPDATE automation_trigger_dispatches SET state = 'dead_letter', last_error = ?, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state NOT IN ('run_created','rejected')")
+      this.prepare("UPDATE automation_trigger_dispatches SET state = 'dead_letter', last_error = ?, redrive_owner = NULL, redrive_expires_at = NULL, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND state NOT IN ('run_created','rejected')")
         .run(reason.slice(0, 500), Date.now(), dispatchId, tenantId)
     })
   }
@@ -457,6 +487,93 @@ export class SqlTriggerStore extends SqlStoreBase {
   async listDispatchesForEvent(tenantId: string, sourceEventId: string): Promise<TriggerDispatch[]> {
     const rows = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE tenant_id = ? AND source_event_id = ? ORDER BY created_at ASC").all(tenantId, sourceEventId) as unknown as DispatchRow[]
     return rows.map(toDispatch)
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2E: fenced redrive lease + stranded/dead-letter inspection.
+  //
+  // A redrive is itself recoverable asynchronous work, so it takes a durable
+  // fenced lease: claimRedriveDispatch atomically stamps a new
+  // redrive_generation + owner + expiry on a non-terminal dispatch. A stale
+  // owner (older generation) cannot finalize — completeRedrive / markRunCreated
+  // CAS-check the generation. A redrive never resurrects a terminal dispatch:
+  // claimRedriveDispatch only matches non-terminal states. This closes the
+  // "late retry resurrects terminal work" race that an unfenced scan-and-drive
+  // would allow.
+  // -------------------------------------------------------------------------
+
+  /** Claim a non-terminal dispatch for a fenced redrive. Returns the lease
+   *  (generation + owner + expiry) or null if the dispatch is terminal, missing,
+   *  or already owned by a non-expired lease. Idempotent per owner: re-claiming
+   *  by the same owner extends the lease. */
+  async claimRedriveDispatch(tenantId: string, dispatchId: string, owner: string, leaseMs: number, now: number = Date.now()): Promise<{ dispatch: TriggerDispatch; generation: number } | null> {
+    return this.atomic("claimRedriveDispatch", () => {
+      const row = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE dispatch_id = ? AND tenant_id = ?").get(dispatchId, tenantId) as unknown as DispatchRow | undefined
+      if (!row) return null
+      // Never resurrect terminal work.
+      if (TERMINAL_DISPATCH_STATES.has(row.state as DispatchState)) return null
+      const expiresAt = now + leaseMs
+      // Claim if no active lease, or the existing lease is ours, or it expired.
+      const leaseActive = row.redrive_owner !== null && row.redrive_expires_at !== null && row.redrive_expires_at > now && row.redrive_owner !== owner
+      if (leaseActive) return null
+      const newGen = row.redrive_generation + 1
+      this.prepare(
+        `UPDATE automation_trigger_dispatches SET redrive_generation = ?, redrive_owner = ?, redrive_expires_at = ?, updated_at = ?
+         WHERE dispatch_id = ? AND tenant_id = ? AND redrive_generation = ?`,
+      ).run(newGen, owner, expiresAt, now, dispatchId, tenantId, row.redrive_generation)
+      const updated = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE dispatch_id = ? AND tenant_id = ?").get(dispatchId, tenantId) as unknown as DispatchRow
+      return { dispatch: toDispatch(updated), generation: newGen }
+    })
+  }
+
+  /** Renew a redrive lease (fenced by generation). Returns false if superseded. */
+  async renewRedriveLease(tenantId: string, dispatchId: string, generation: number, leaseMs: number, now: number = Date.now()): Promise<boolean> {
+    return this.atomic("renewRedriveLease", () => {
+      const res = this.prepare("UPDATE automation_trigger_dispatches SET redrive_expires_at = ?, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND redrive_generation = ?").run(now + leaseMs, now, dispatchId, tenantId, generation)
+      return res.changes > 0
+    })
+  }
+
+  /** Release a redrive lease (fenced). Clears owner/expiry so another owner
+   *  may claim. Idempotent. */
+  async releaseRedriveLease(tenantId: string, dispatchId: string, generation: number, now: number = Date.now()): Promise<void> {
+    this.atomic("releaseRedriveLease", () => {
+      this.prepare("UPDATE automation_trigger_dispatches SET redrive_owner = NULL, redrive_expires_at = NULL, updated_at = ? WHERE dispatch_id = ? AND tenant_id = ? AND redrive_generation = ?").run(now, dispatchId, tenantId, generation)
+    })
+  }
+
+  /** List dispatches stranded in a non-terminal state (recovery input).
+   *  Tenant-scoped; bounded for stable continuation. */
+  async listStrandedDispatches(tenantId: string, limit = 100): Promise<TriggerDispatch[]> {
+    const rows = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE tenant_id = ? AND state NOT IN ('run_created','rejected','dead_letter') ORDER BY created_at ASC LIMIT ?").all(tenantId, limit) as unknown as DispatchRow[]
+    return rows.map(toDispatch)
+  }
+
+  /** List dead-lettered dispatches (operator inspection; tenant-scoped). */
+  async listDeadLetteredDispatches(tenantId: string, limit = 100): Promise<TriggerDispatch[]> {
+    const rows = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE tenant_id = ? AND state = 'dead_letter' ORDER BY updated_at ASC LIMIT ?").all(tenantId, limit) as unknown as DispatchRow[]
+    return rows.map(toDispatch)
+  }
+
+  /** Operator redrive of a dead-lettered dispatch: re-arm to a fresh
+   *  retryable_failure state with a reset attempt counter. Fenced + idempotent;
+   *  never resurrects a run_created/rejected dispatch (returns it unchanged).
+   *  The next redrive pass picks it up under a fresh fenced lease. */
+  async redriveDeadLetter(tenantId: string, dispatchId: string, now: number = Date.now()): Promise<TriggerDispatch | null> {
+    return this.atomic("redriveDeadLetter", () => {
+      const row = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE dispatch_id = ? AND tenant_id = ?").get(dispatchId, tenantId) as unknown as DispatchRow | undefined
+      if (!row) return null
+      // Never resurrect terminal successful/rejected dispatches.
+      if (row.state === "run_created" || row.state === "rejected") return toDispatch(row)
+      if (row.state === "dead_letter") {
+        this.prepare(
+          `UPDATE automation_trigger_dispatches SET state = 'retryable_failure', attempts = 0, last_error = ?, redrive_owner = NULL, redrive_expires_at = NULL, updated_at = ?
+           WHERE dispatch_id = ? AND tenant_id = ? AND state = 'dead_letter'`,
+        ).run(`operator redrive at ${now}`, now, dispatchId, tenantId)
+      }
+      const updated = this.prepare("SELECT * FROM automation_trigger_dispatches WHERE dispatch_id = ? AND tenant_id = ?").get(dispatchId, tenantId) as unknown as DispatchRow
+      return toDispatch(updated)
+    })
   }
 }
 

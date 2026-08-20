@@ -28,6 +28,8 @@ import type { SqlBillingStore } from "@vaulltcore/billing"
 import type { SqlAuditStore } from "@vaulltcore/audit"
 import { ReconciliationService, type JobIndex, type ReconciliationDeps } from "@vaulltcore/reconcile"
 import type { SnapshotGcDriver } from "@vaulltcore/store-sql"
+import { AUTOMATION_ROUTES, type AutomationLayer, type AutomationRouteContext, buildAutomationLayer } from "./automation-routes"
+import { AutomationError } from "@vaulltcore/automation"
 
 export interface ControlPlaneOptions {
   readonly runner: AgentRunner
@@ -41,6 +43,9 @@ export interface ControlPlaneOptions {
    *  create) and read endpoints expose organizations/projects/quotas/usage/
    *  billing/audit. When absent, the legacy thin-façade behavior is preserved. */
   readonly business?: BusinessLayerOptions
+  /** Phase 2A: automation product layer. When provided (requires the business
+   *  layer for admission), the /automation/* product routes are registered. */
+  readonly automation?: AutomationLayerOptions
 }
 
 /** Business-layer wiring. All stores share one SQL database. */
@@ -62,6 +67,15 @@ export interface BusinessLayerOptions {
   readonly reconciliationStore?: ReconciliationDeps["store"]
   /** Phase 1F: snapshot GC driver. Required for snapshot GC operations endpoints. */
   readonly snapshotGc?: SnapshotGcDriver
+}
+
+/** Phase 2A: automation product-layer wiring. The store/delivery/artifacts are
+ *  provider-neutral; the admission + runner drive Phase 1 jobs through the
+ *  {@link AutomationJobDispatcher} seam. */
+export interface AutomationLayerOptions {
+  readonly store: import("@vaulltcore/automation").AutomationServiceDeps["store"]
+  readonly artifacts?: import("@vaulltcore/automation").AutomationServiceDeps["artifacts"]
+  readonly delivery?: import("@vaulltcore/automation").AutomationServiceDeps["delivery"]
 }
 
 interface CreateJobRequestBody {
@@ -94,6 +108,8 @@ export class ControlPlane {
   private readonly routes: Array<{ method: string; pattern: RegExp; keys: string[]; handler: Handler }> = []
   private readonly business: BusinessLayerOptions | null
   private readonly admission: AdmissionPipeline | null
+  private readonly automation: AutomationLayer | null
+  private readonly automationContext: AutomationRouteContext | null
 
   constructor(options: ControlPlaneOptions) {
     this.runner = options.runner
@@ -109,6 +125,25 @@ export class ControlPlane {
           audit: this.business.audit,
           idempotency: this.business.admissionIdempotency ?? new InMemoryAdmissionIdempotencyRegistry(),
         })
+      : null
+    // Phase 2A: build the automation layer over the admission + runner seam.
+    this.automation = options.automation && this.admission && this.business
+      ? buildAutomationLayer({
+          store: options.automation.store,
+          ...(options.automation.artifacts ? { artifacts: options.automation.artifacts } : {}),
+          ...(options.automation.delivery ? { delivery: options.automation.delivery } : {}),
+          admission: this.admission,
+          runner: this.runner,
+          audit: this.business.audit,
+        })
+      : null
+    this.automationContext = this.automation
+      ? {
+          service: this.automation.service,
+          resolvePrincipal: (req, authn) => this.resolvePrincipal(req, authn as AuthnPrincipal),
+          json: (res, status, body) => this.json(res, status, body),
+          readBody: (req) => this.readBody(req),
+        }
       : null
     this.add("POST", "/jobs", this.createJob)
     this.add("GET", "/jobs/:jobId", this.getJob)
@@ -132,6 +167,12 @@ export class ControlPlane {
     this.add("GET", "/reconcile/health", this.reconcileHealth)
     this.add("GET", "/operations/health", this.operationsHealth)
     this.add("POST", "/operations/snapshot-gc", this.triggerSnapshotGc)
+  }
+
+  /** Phase 2A: the automation product service (null when not wired). Tests and
+   *  integrations use this to drive the service directly. */
+  get automationService(): AutomationLayer["service"] | null {
+    return this.automation?.service ?? null
   }
 
   private add(method: string, path: string, handler: Handler): void {
@@ -159,6 +200,22 @@ export class ControlPlane {
         this.json(res, 401, { error: { code: "UNAUTHENTICATED", message: "authentication required" } })
         return
       }
+      // Phase 2A: automation product routes (when the automation layer is wired).
+      if (this.automationContext && url.pathname.startsWith("/automation")) {
+        const ar = AUTOMATION_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
+        if (!ar) {
+          this.json(res, 404, { error: { code: "NOT_FOUND", message: "unknown automation route" } })
+          return
+        }
+        const values = ar.pattern.exec(url.pathname)
+        const params: Record<string, string> = {}
+        ar.keys.forEach((key, i) => {
+          params[key] = values?.[i + 1] ?? ""
+        })
+        const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+        await ar.handler(req, res, params, authn, url.searchParams, this.automationContext)
+        return
+      }
       const route = this.routes.find((r) => r.method === req.method && r.pattern.test(url.pathname))
       if (!route) {
         this.json(res, 404, { error: { code: "NOT_FOUND", message: "unknown route" } })
@@ -171,6 +228,10 @@ export class ControlPlane {
       })
       await route.handler(req, res, params, principal!, url.searchParams)
     } catch (error) {
+      if (error instanceof AutomationError) {
+        this.json(res, error.status, { error: { code: error.code, message: error.message } })
+        return
+      }
       if (error instanceof AdmissionError) {
         this.json(res, error.status, { error: { code: error.code, message: error.message } })
         return

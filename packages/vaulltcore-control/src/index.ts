@@ -11,3 +11,11 @@ export {
   type AdmissionIdempotencyRecord,
   type AdmissionIdempotencyRegistry,
 } from "./admission"
+export {
+  AdmissionJobDispatcher,
+  buildAutomationLayer,
+  AUTOMATION_ROUTES,
+  type AutomationLayer,
+  type AutomationRouteContext,
+} from "./automation-routes"
+export { type AutomationLayerOptions } from "./server"

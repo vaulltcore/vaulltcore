@@ -122,18 +122,22 @@ describe("OperationalWorker fencing + replacement", () => {
     expect(store.getById("w1")!.claimant).toBe("B")
   })
 
-  it("retriable failure schedules retry; terminal failure after max attempts", async () => {
+  it("retriable failure schedules retry; terminal exhaustion enters dead-letter after max attempts", async () => {
     enqueue(store, "w1", "delivery_retry")
     const reaper = recordingReaper([{ kind: "failed_retriable", reason: "boom", retryClass: "transient", nextRetryAt: 100 }])
     const deps: OperationalWorkerDeps = { store, reapers: new Map([["delivery_retry", reaper]]), maxAttempts: 2 }
     const worker = new OperationalWorker({ workerId: "w", leaseMs: 1000, heartbeatIntervalMs: 100, now: () => 0, sleep: async () => {} }, deps)
     let res = await worker.runOnce()
     expect(res!.state).toBe("failed_retriable")
-    // Retry once (after nextRetryAt).
+    // Retry once (after nextRetryAt). Exceeding max attempts dead-letters.
     const worker2 = new OperationalWorker({ workerId: "w", leaseMs: 1000, heartbeatIntervalMs: 100, now: () => 100, sleep: async () => {} }, deps)
     res = await worker2.runOnce()
-    expect(res!.state).toBe("failed_terminal")
+    // Phase 2E: exhausted retries enter an explicit dead-letter state (a
+    // distinct terminal state operators can redrive from).
+    expect(res!.state).toBe("dead_letter")
     expect(store.getById("w1")!.attempts).toBe(2)
+    // The dead-lettered item is no longer claimable.
+    expect(store.claim("w", 1000, 200)).toBeNull()
   })
 
   it("no reaper wired → terminal failure (config error, not retriable)", async () => {

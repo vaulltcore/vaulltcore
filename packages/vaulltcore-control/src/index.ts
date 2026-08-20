@@ -21,3 +21,4 @@ export {
 export { type AutomationLayerOptions } from "./server"
 export { PHASE2B_ROUTES, type Phase2bLayerOptions, type Phase2bRouteContext } from "./phase2b-routes"
 export { PHASE2D_ROUTES, type Phase2dLayerOptions, type Phase2dRouteContext, type Phase2dRoute, TriggerRunSinkImpl } from "./phase2d-routes"
+export { PHASE2E_ROUTES, type Phase2eLayerOptions, type Phase2eRouteContext, type Phase2eRoute } from "./phase2e-routes"

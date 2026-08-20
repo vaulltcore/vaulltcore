@@ -80,6 +80,28 @@ export const AUDIT_EVENT_TYPES = [
   "trigger_dead_lettered",
   "model_connection_activated",
   "model_connection_deactivated",
+  // Phase 2E: production reliability + operational telemetry. Additive
+  // (TEXT-persisted type). Every reliability lifecycle action emits a durable,
+  // sanitized audit record; secrets are stripped by sanitizeMetadata before
+  // write. These cover leases, retries, dead-letters, redrives, reconciliation,
+  // capacity/backpressure, cancellation, timeouts, and terminal settlement.
+  "lease_acquired",
+  "lease_renewed",
+  "lease_expired",
+  "lease_lost",
+  "retry_scheduled",
+  "retry_attempted",
+  "retry_exhausted",
+  "work_dead_lettered",
+  "work_redriven",
+  "reconciliation_detected",
+  "reconciliation_recovered",
+  "capacity_admitted",
+  "capacity_released",
+  "capacity_reclaimed",
+  "work_cancelled",
+  "work_timed_out",
+  "work_terminal",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

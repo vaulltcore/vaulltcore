@@ -23,6 +23,7 @@ import {
   type OpsWorkState,
   OPS_WORK_KINDS,
   OPS_WORK_STATES,
+  TERMINAL_OPS_STATES,
 } from "./contracts"
 
 const MIGRATIONS: Migration[] = [
@@ -52,6 +53,19 @@ const MIGRATIONS: Migration[] = [
       )`,
       `CREATE INDEX IF NOT EXISTS idx_ops_claimable ON ops_work_items (state, next_retry_at, kind)`,
       `CREATE INDEX IF NOT EXISTS idx_ops_expires ON ops_work_items (state, claim_expires_at)`,
+    ],
+  },
+  // Phase 2E: explicit dead-letter state + operator redrive + bounded
+  // reconciliation scanning. Name is globally unique (dedup-by-name rule).
+  // The CHECK constraint in v1 already accepts 'dead_letter' (OPS_WORK_STATES
+  // was widened); these indexes accelerate recovery scans. Idempotent on re-run.
+  {
+    name: "ops_reliability",
+    version: 2,
+    statements: [
+      `CREATE INDEX IF NOT EXISTS idx_ops_dead_letter ON ops_work_items (tenant_id, state)`,
+      `CREATE INDEX IF NOT EXISTS idx_ops_retriable ON ops_work_items (tenant_id, state, next_retry_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_ops_updated ON ops_work_items (tenant_id, state, updated_at)`,
     ],
   },
 ]
@@ -188,7 +202,9 @@ export class SqlOpsStore extends SqlStoreBase {
       } else {
         // failed_retriable
         if (attempts >= maxAttempts) {
-          state = "failed_terminal"
+          // Phase 2E: exhausted retries enter an explicit dead-letter state
+          // (distinct from failed_terminal) so operators can redrive safely.
+          state = "dead_letter"
           lastError = `${result.reason} (max_attempts_exceeded)`
           retryClass = result.retryClass
         } else {
@@ -236,5 +252,80 @@ export class SqlOpsStore extends SqlStoreBase {
   getById(itemId: string): OpsWorkItem | null {
     const row = this.prepare(`SELECT * FROM ops_work_items WHERE id = ?`).get(itemId) as unknown as OpsWorkRow | undefined
     return row ? rowToItem(row) : null
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2E: dead-letter + operator redrive + bounded reconciliation scanning.
+  // All transitions are fenced (CAS on state) and idempotent. A late worker
+  // whose generation was superseded cannot resurrect terminal/dead-lettered
+  // work: terminal states are never transitioned out by the redrive path, and
+  // a non-terminal redrive resets the attempt counter and re-arm retry.
+  // -------------------------------------------------------------------------
+
+  /** Transition a non-terminal item to dead_letter (terminal; idempotent).
+   *  Sanitized diagnostic context only — never secrets. */
+  deadLetter(tenantId: string, itemId: string, reason: string, now: number = Date.now()): OpsWorkItem | null {
+    return this.atomic("deadLetter", () => {
+      this.prepare(
+        `UPDATE ops_work_items SET state = 'dead_letter', last_error = ?, claimant = NULL, claim_expires_at = NULL, next_retry_at = NULL, updated_at = ?
+         WHERE id = ? AND tenant_id = ? AND state NOT IN ('succeeded','failed_terminal','dead_letter')`,
+      ).run(reason.slice(0, 500), now, itemId, tenantId)
+      const row = this.prepare(`SELECT * FROM ops_work_items WHERE id = ? AND tenant_id = ?`).get(itemId, tenantId) as unknown as OpsWorkRow | undefined
+      return row ? rowToItem(row) : null
+    })
+  }
+
+  /** Operator redrive: re-arm a dead-lettered (or stuck failed_retriable) item
+   *  for a fresh retry pass. This is idempotent + fenced: redriving an already
+   *  re-armed item is a no-op; redriving a terminal succeeded/failed_terminal
+   *  item is rejected (returns the unchanged item) — a late redrive NEVER
+   *  resurrects terminal work. The attempt counter is reset per redrive so the
+   *  bounded retry policy gets a fresh budget; the retryClass is preserved so
+   *  the classifier still knows how the work failed. */
+  redrive(tenantId: string, itemId: string, now: number = Date.now()): OpsWorkItem | null {
+    return this.atomic("redrive", () => {
+      const row = this.prepare(`SELECT * FROM ops_work_items WHERE id = ? AND tenant_id = ?`).get(itemId, tenantId) as unknown as OpsWorkRow | undefined
+      if (!row) return null
+      // Never resurrect terminal succeeded/failed_terminal work.
+      if (row.state === "succeeded" || row.state === "failed_terminal") return rowToItem(row)
+      if (row.state === "dead_letter" || row.state === "failed_retriable") {
+        this.prepare(
+          `UPDATE ops_work_items SET state = 'pending', attempts = 0, next_retry_at = NULL, claimant = NULL, claim_expires_at = NULL, generation = generation + 1, last_error = ?,
+            updated_at = ?
+           WHERE id = ? AND tenant_id = ? AND state IN ('dead_letter','failed_retriable')`,
+        ).run(`redriven at ${now}`, now, itemId, tenantId)
+      }
+      const updated = this.prepare(`SELECT * FROM ops_work_items WHERE id = ? AND tenant_id = ?`).get(itemId, tenantId) as unknown as OpsWorkRow
+      return rowToItem(updated)
+    })
+  }
+
+  /** List dead-lettered items (tenant-scoped; cross-tenant returns empty). */
+  listDeadLettered(tenantId: string, limit = 100): OpsWorkItem[] {
+    const rows = this.prepare(`SELECT * FROM ops_work_items WHERE tenant_id = ? AND state = 'dead_letter' ORDER BY updated_at ASC LIMIT ?`).all(tenantId, limit) as unknown as OpsWorkRow[]
+    return rows.map(rowToItem)
+  }
+
+  /** Bounded batch of non-terminal items eligible for reconciliation scanning,
+   *  ordered by updated_at for stable continuation. Returns items + a
+   *  continuation cursor (the last updated_at + id) so a caller can page
+   *  without scanning unboundedly. A repeated scan re-reads from durable state;
+   *  idempotent enqueue (UNIQUE idempotency_key) collapses duplicates. */
+  listPendingBatch(tenantId: string, limit: number, afterUpdatedAt: number | null = null, afterId: string | null = null): { items: OpsWorkItem[]; nextCursor: { updatedAt: number; id: string } | null } {
+    const rows = (afterUpdatedAt === null
+      ? this.prepare(`SELECT * FROM ops_work_items WHERE tenant_id = ? AND state IN ('pending','claimed','failed_retriable') ORDER BY updated_at ASC, id ASC LIMIT ?`).all(tenantId, limit) as unknown as OpsWorkRow[]
+      : this.prepare(`SELECT * FROM ops_work_items WHERE tenant_id = ? AND state IN ('pending','claimed','failed_retriable') AND (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY updated_at ASC, id ASC LIMIT ?`).all(tenantId, afterUpdatedAt, afterUpdatedAt, afterId ?? "", limit) as unknown as OpsWorkRow[])
+    const items = rows.map(rowToItem)
+    const last = items.length > 0 ? items[items.length - 1]! : null
+    return {
+      items,
+      nextCursor: last ? { updatedAt: last.updatedAt, id: last.id } : null,
+    }
+  }
+
+  /** Count items by state (tenant-scoped). For operational health/backlog. */
+  countByState(tenantId: string, state: OpsWorkState): number {
+    const row = this.prepare(`SELECT COUNT(*) AS n FROM ops_work_items WHERE tenant_id = ? AND state = ?`).get(tenantId, state) as { n: number }
+    return Number(row.n)
   }
 }

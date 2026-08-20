@@ -24,6 +24,7 @@
     { "path": "packages/vaulltcore-git" },
     { "path": "packages/vaulltcore-connectors" },
     { "path": "packages/vaulltcore-models" },
-    { "path": "packages/vaulltcore-webhooks" }
+    { "path": "packages/vaulltcore-webhooks" },
+    { "path": "packages/vaulltcore-reliability" }
   ]
 }

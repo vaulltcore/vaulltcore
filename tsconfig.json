@@ -13,6 +13,11 @@
     { "path": "packages/vaulltcore-audit" },
     { "path": "packages/vaulltcore-reconcile" },
     { "path": "packages/vaulltcore-control" },
-    { "path": "packages/vaulltcore-automation" }
+    { "path": "packages/vaulltcore-automation" },
+    { "path": "packages/vaulltcore-artifacts" },
+    { "path": "packages/vaulltcore-delivery" },
+    { "path": "packages/vaulltcore-ops" },
+    { "path": "packages/vaulltcore-scheduler" },
+    { "path": "packages/vaulltcore-recovery" }
   ]
 }

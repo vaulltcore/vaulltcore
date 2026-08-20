@@ -266,6 +266,13 @@ export interface AutomationStore {
   // events
   appendEvent(tenantId: string, event: AutomationEvent): Promise<void>
   listEvents(tenantId: string, runId: string, afterSeq?: number): Promise<AutomationEvent[]>
+  // -- Phase 2B: tenant-wide operational listings (read-only, recovery/ops) --
+  /** Pending approvals past their expiresAt (tenant-scoped). */
+  listExpiredApprovals(tenantId: string, now?: number): Promise<ApprovalRequest[]>
+  /** Failed delivery attempts whose run is still in a delivery-capable state. */
+  listFailedDeliveriesForRetry(tenantId: string): Promise<DeliveryAttempt[]>
+  /** Non-terminal runs whose updated_at is older than the staleness threshold. */
+  listStaleRuns(tenantId: string, staleBefore: number, limit?: number): Promise<AutomationRun[]>
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,6 +1019,29 @@ export class SqlAutomationStore extends SqlStoreBase implements AutomationStore 
       `SELECT e.* FROM automation_events e JOIN automation_runs r ON r.run_id = e.run_id WHERE r.tenant_id = ? AND e.run_id = ? AND e.seq > ? ORDER BY e.seq ASC`,
     ).all(tenantId, runId, afterSeq) as unknown as Array<{ run_id: string; seq: number; timestamp: number; type: string; data: string }>
     return rows.map(toEvent)
+  }
+
+  // -- Phase 2B: tenant-wide operational listings --------------------------
+
+  async listExpiredApprovals(tenantId: string, now = Date.now()): Promise<ApprovalRequest[]> {
+    const rows = this.prepare(
+      `SELECT a.* FROM approval_requests a JOIN automation_runs r ON r.run_id = a.run_id WHERE r.tenant_id = ? AND a.status = 'pending' AND a.expires_at IS NOT NULL AND a.expires_at <= ? ORDER BY a.created_at ASC`,
+    ).all(tenantId, now) as unknown as ApprovalRow[]
+    return rows.map(toApproval)
+  }
+
+  async listFailedDeliveriesForRetry(tenantId: string): Promise<DeliveryAttempt[]> {
+    const rows = this.prepare(
+      `SELECT d.* FROM delivery_attempts d JOIN automation_runs r ON r.run_id = d.run_id WHERE r.tenant_id = ? AND d.status = 'failed' AND r.status IN ('delivering','failed') ORDER BY d.updated_at ASC`,
+    ).all(tenantId) as unknown as DeliveryRow[]
+    return rows.map(toDelivery)
+  }
+
+  async listStaleRuns(tenantId: string, staleBefore: number, limit = 100): Promise<AutomationRun[]> {
+    const rows = this.prepare(
+      `SELECT * FROM automation_runs WHERE tenant_id = ? AND status IN ('admitted','running','collecting','awaiting_approval','delivering') AND updated_at < ? ORDER BY updated_at ASC LIMIT ?`,
+    ).all(tenantId, staleBefore, limit) as unknown as RunRow[]
+    return rows.map(toRun)
   }
 }
 

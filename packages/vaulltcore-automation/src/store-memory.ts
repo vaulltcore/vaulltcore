@@ -393,4 +393,36 @@ export class InMemoryAutomationStore implements AutomationStore {
     if (!run || run.tenantId !== tenantId) return []
     return (this.events.get(runId) ?? []).filter((e) => e.seq > afterSeq).map((e) => ({ ...e }))
   }
+
+  // -- Phase 2B: tenant-wide operational listings --------------------------
+
+  async listExpiredApprovals(tenantId: string, now = Date.now()): Promise<ApprovalRequest[]> {
+    const out: ApprovalRequest[] = []
+    for (const a of this.approvals.values()) {
+      const run = this.runs.get(a.runId)
+      if (!run || run.tenantId !== tenantId) continue
+      if (a.status === "pending" && a.expiresAt !== null && a.expiresAt <= now) out.push({ ...a })
+    }
+    return out
+  }
+
+  async listFailedDeliveriesForRetry(tenantId: string): Promise<DeliveryAttempt[]> {
+    const out: DeliveryAttempt[] = []
+    for (const d of this.deliveries.values()) {
+      const run = this.runs.get(d.runId)
+      if (!run || run.tenantId !== tenantId) continue
+      if (d.status !== "failed") continue
+      if (run.status === "delivering" || run.status === "failed") out.push({ ...d })
+    }
+    return out
+  }
+
+  async listStaleRuns(tenantId: string, staleBefore: number, limit = 100): Promise<AutomationRun[]> {
+    const stale = new Set(["admitted", "running", "collecting", "awaiting_approval", "delivering"] as const)
+    return [...this.runs.values()]
+      .filter((r) => r.tenantId === tenantId && stale.has(r.status as never) && r.updatedAt < staleBefore)
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(0, limit)
+      .map((r) => ({ ...r }))
+  }
 }

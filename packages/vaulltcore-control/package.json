@@ -17,7 +17,9 @@
     "@vaulltcore/billing": "*",
     "@vaulltcore/audit": "*",
     "@vaulltcore/reconcile": "*",
-    "@vaulltcore/automation": "*"
+    "@vaulltcore/automation": "*",
+    "@vaulltcore/scheduler": "*",
+    "@vaulltcore/ops": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

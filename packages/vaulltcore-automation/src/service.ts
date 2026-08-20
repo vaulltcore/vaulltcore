@@ -384,6 +384,13 @@ export class AutomationService {
     return this.deps.store.listArtifacts(principal.tenantId, runId)
   }
 
+  /** List delivery attempts for a run (tenant-scoped; empty for cross-tenant). */
+  async listRunDeliveries(principal: ResolvedPrincipal, runId: string): Promise<DeliveryAttempt[]> {
+    const run = await this.getRun(principal, runId)
+    if (!run) return []
+    return this.deps.store.listDeliveryAttempts(principal.tenantId, runId)
+  }
+
   // -- orchestration -------------------------------------------------------
 
   /** Advance a run: dispatch each pending step in dependency order, project

@@ -33,6 +33,21 @@ export const AUDIT_EVENT_TYPES = [
   "ownership_recovered",
   "policy_decision",
   "ledger_entry",
+  // Phase 2A: automation product-layer actions. Additive — the audit store
+  // persists `type` as TEXT, so no schema change is required. These let the
+  // product layer audit template/version/run/approval/delivery actions through
+  // the same append-only, sanitized audit log (no second audit model).
+  "automation_template_created",
+  "automation_template_archived",
+  "automation_version_published",
+  "automation_run_created",
+  "automation_run_cancelled",
+  "automation_run_failed",
+  "automation_run_completed",
+  "automation_approval_requested",
+  "automation_approval_approved",
+  "automation_approval_rejected",
+  "automation_delivery_completed",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

@@ -48,6 +48,8 @@ export const AUDIT_EVENT_TYPES = [
   "automation_approval_approved",
   "automation_approval_rejected",
   "automation_delivery_completed",
+  // Phase 2B: operational recovery. Additive (TEXT-persisted type).
+  "automation_recovery_scan",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

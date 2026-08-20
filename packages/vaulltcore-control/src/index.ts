@@ -19,3 +19,4 @@ export {
   type AutomationRouteContext,
 } from "./automation-routes"
 export { type AutomationLayerOptions } from "./server"
+export { PHASE2B_ROUTES, type Phase2bLayerOptions, type Phase2bRouteContext } from "./phase2b-routes"

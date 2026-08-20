@@ -29,6 +29,7 @@ import type { SqlAuditStore } from "@vaulltcore/audit"
 import { ReconciliationService, type JobIndex, type ReconciliationDeps } from "@vaulltcore/reconcile"
 import type { SnapshotGcDriver } from "@vaulltcore/store-sql"
 import { AUTOMATION_ROUTES, type AutomationLayer, type AutomationRouteContext, buildAutomationLayer } from "./automation-routes"
+import { PHASE2B_ROUTES, type Phase2bRouteContext, type Phase2bLayerOptions } from "./phase2b-routes"
 import { AutomationError } from "@vaulltcore/automation"
 
 export interface ControlPlaneOptions {
@@ -46,6 +47,9 @@ export interface ControlPlaneOptions {
   /** Phase 2A: automation product layer. When provided (requires the business
    *  layer for admission), the /automation/* product routes are registered. */
   readonly automation?: AutomationLayerOptions
+  /** Phase 2B: production scheduling/delivery-observability/retry-status/
+   *  SSE/health/metrics routes. Requires the automation layer. */
+  readonly phase2b?: Phase2bLayerOptions
 }
 
 /** Business-layer wiring. All stores share one SQL database. */
@@ -110,6 +114,7 @@ export class ControlPlane {
   private readonly admission: AdmissionPipeline | null
   private readonly automation: AutomationLayer | null
   private readonly automationContext: AutomationRouteContext | null
+  private readonly phase2bContext: Phase2bRouteContext | null
 
   constructor(options: ControlPlaneOptions) {
     this.runner = options.runner
@@ -140,6 +145,19 @@ export class ControlPlane {
     this.automationContext = this.automation
       ? {
           service: this.automation.service,
+          resolvePrincipal: (req, authn) => this.resolvePrincipal(req, authn as AuthnPrincipal),
+          json: (res, status, body) => this.json(res, status, body),
+          readBody: (req) => this.readBody(req),
+        }
+      : null
+    // Phase 2B: schedule/delivery/retry/SSE/health/metrics routes. Requires the
+    // automation layer (for the service) + scheduler/ops stores.
+    this.phase2bContext = options.phase2b && this.automationContext
+      ? {
+          service: this.automation!.service,
+          schedulerStore: options.phase2b.schedulerStore,
+          scheduler: options.phase2b.scheduler ?? null,
+          opsStore: options.phase2b.opsStore,
           resolvePrincipal: (req, authn) => this.resolvePrincipal(req, authn as AuthnPrincipal),
           json: (res, status, body) => this.json(res, status, body),
           readBody: (req) => this.readBody(req),
@@ -202,6 +220,19 @@ export class ControlPlane {
       }
       // Phase 2A: automation product routes (when the automation layer is wired).
       if (this.automationContext && url.pathname.startsWith("/automation")) {
+        // Phase 2B routes are more specific (schedules, deliveries, stream);
+        // try them first so they win over the generic automation routes.
+        if (this.phase2bContext) {
+          const p2 = PHASE2B_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
+          if (p2) {
+            const values = p2.pattern.exec(url.pathname)
+            const params: Record<string, string> = {}
+            p2.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
+            const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+            await p2.handler(req, res, params, authn, url.searchParams, this.phase2bContext)
+            return
+          }
+        }
         const ar = AUTOMATION_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
         if (!ar) {
           this.json(res, 404, { error: { code: "NOT_FOUND", message: "unknown automation route" } })
@@ -215,6 +246,18 @@ export class ControlPlane {
         const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
         await ar.handler(req, res, params, authn, url.searchParams, this.automationContext)
         return
+      }
+      // Phase 2B operations routes (retry-status, health) under /operations.
+      if (this.phase2bContext && (url.pathname.startsWith("/operations/retry-status") || url.pathname.startsWith("/operations/health/p2b"))) {
+        const p2 = PHASE2B_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
+        if (p2) {
+          const values = p2.pattern.exec(url.pathname)
+          const params: Record<string, string> = {}
+          p2.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          await p2.handler(req, res, params, authn, url.searchParams, this.phase2bContext)
+          return
+        }
       }
       const route = this.routes.find((r) => r.method === req.method && r.pattern.test(url.pathname))
       if (!route) {

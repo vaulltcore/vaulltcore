@@ -94,6 +94,12 @@ export interface ResolvedPrincipal {
   readonly projectScope: readonly string[]
   /** True only for cross-tenant operators (deny by default). */
   readonly admin?: boolean
+  /** Phase 1F: the API key id that authenticated this principal (if any). */
+  readonly apiKeyId?: string
+  /** Phase 1F: project scope restriction carried by the authenticating API key
+   *  (a JSON array of allowed project ids; null = unrestricted within grants).
+   *  Enforced at authorize time in ADDITION to the principal's grants. */
+  readonly apiKeyScope?: readonly string[] | null
 }
 
 /**
@@ -114,6 +120,17 @@ export interface ApiKeyRecord {
   readonly createdAt: number
   readonly revokedAt: number | null
   readonly lastUsedAt: number | null
+  /** Phase 1F: absolute expiry (ms epoch); null = no expiry. An expired key is
+   *  rejected at authentication exactly like a revoked key. */
+  readonly expiresAt: number | null
+  /** Phase 1F: project scope restriction. A JSON array of allowed project ids;
+   *  null = all projects the principal is granted within the org. */
+  readonly scope: readonly string[] | null
+  /** Phase 1F: keyId this key was rotated from (replacement side of rotation). */
+  readonly rotatedFrom: string | null
+  /** Phase 1F: when this (old) key's overlap window ends during rotation; the
+   *  reaper/auto-expire revokes it at this time. */
+  readonly overlapExpiresAt: number | null
 }
 
 /** Returned once when an API key is created. The secret is never recoverable. */

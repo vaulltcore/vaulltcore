@@ -353,7 +353,15 @@ export class SqlQuotaStore extends SqlStoreBase {
     })
   }
 
-  /** Mark expired active reservations released (reclaims their capacity). */
+  /** Mark expired active reservations released (reclaims their capacity).
+   *
+   * Phase 1F: the reaper is idempotent and fenced. It only transitions
+   * `active` reservations whose `expires_at` has passed; a reservation that was
+   * renewed (expiry pushed forward) or settled/released concurrently is skipped
+   * by the `state = 'active' AND expires_at <= ?` predicate, so renewed or
+   * settled work is NEVER reclaimed. Repeated reaper runs produce no
+   * double-release: an already-`expired` row no longer matches the predicate.
+   * Capacity is decremented at most once per reservation. */
   async reapExpired(now: number = Date.now()): Promise<number> {
     return this.atomic("reapExpired", () => {
       const expired = this.prepare("SELECT reservation_id, tenant_id, org_id, project_id FROM quota_reservations WHERE state = 'active' AND expires_at <= ?").all(now) as Array<{
@@ -368,5 +376,46 @@ export class SqlQuotaStore extends SqlStoreBase {
       }
       return expired.length
     })
+  }
+
+  /**
+   * Renew (extend the expiry of) an active reservation for progressing work
+   * (Phase 1F). This is the admission-reservation TTL refresh, distinct from
+   * the execution ownership lease and the worker heartbeat (see docs). Fenced by
+   * `expectedVersion`: a stale writer (version mismatch) is rejected and can
+   * never extend a reservation it no longer owns. Renewing a settled/released/
+   * expired reservation is rejected (it no longer holds capacity). Idempotent
+   * only in the sense that re-renewing with the current version extends again;
+   * callers must re-read the version after each renewal.
+   */
+  async renewReservation(reservationId: string, expectedVersion: number, extendMs: number): Promise<QuotaReservation> {
+    const now = Date.now()
+    return this.atomic("renewReservation", () => {
+      const row = this.prepare("SELECT * FROM quota_reservations WHERE reservation_id = ?").get(reservationId) as unknown as ReservationRow | undefined
+      if (!row) throw new QuotaError("RESERVATION_NOT_FOUND", `Reservation ${reservationId} not found`)
+      if (row.version !== expectedVersion) throw new QuotaError("RESERVATION_FENCED", `Reservation ${reservationId} is owned by a newer version`)
+      if (row.state !== "active") {
+        throw new QuotaError("INVALID_RESERVATION_STATE", `Cannot renew reservation in state "${row.state}"`)
+      }
+      // Extend from the later of now and the current expiry so a renewal never
+      // shortens an existing window (clock-skew safe).
+      const base = Math.max(now, row.expires_at)
+      const newExpiry = base + extendMs
+      const result = this.prepare(
+        "UPDATE quota_reservations SET expires_at = ?, version = version + 1 WHERE reservation_id = ? AND version = ? AND state = 'active'",
+      ).run(newExpiry, reservationId, expectedVersion)
+      if (result.changes === 0) throw new QuotaError("RESERVATION_FENCED", `Reservation ${reservationId} is owned by a newer version`)
+      const updated = this.prepare("SELECT * FROM quota_reservations WHERE reservation_id = ?").get(reservationId) as unknown as ReservationRow
+      return toReservation(updated)
+    })
+  }
+
+  /** List active reservations whose TTL has elapsed (reaper candidates), for
+   *  operational inspection. Does not mutate state. */
+  async listExpiredActive(now: number = Date.now()): Promise<QuotaReservation[]> {
+    const rows = this.prepare(
+      "SELECT * FROM quota_reservations WHERE state = 'active' AND expires_at <= ?",
+    ).all(now) as unknown as ReservationRow[]
+    return rows.map(toReservation)
   }
 }

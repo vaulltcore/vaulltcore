@@ -147,34 +147,125 @@ export const MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX snapshot_lifecycle_job_idx ON snapshot_lifecycle (job_id, state)`,
     ],
   },
+  {
+    // Phase 1F: durable distributed admission idempotency. The claim/complete/
+    // fail state machine serializes concurrent admissions of the same
+    // (tenant, key) across separate control-plane processes. UNIQUE(tenant_id,
+    // idempotency_key) is the linearization point; the request fingerprint
+    // distinguishes a legitimate replay from a conflicting key reuse. Only the
+    // SHA-256 fingerprint is stored — never secret request material.
+    version: 8,
+    name: "admission_idempotency",
+    statements: [
+      `CREATE TABLE admission_idempotency (
+        tenant_id       TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        fingerprint     TEXT NOT NULL,
+        state           TEXT NOT NULL,
+        job_id          TEXT,
+        reservation_id  TEXT,
+        failure_code    TEXT,
+        failure_detail  TEXT,
+        created_at      BIGINT NOT NULL,
+        updated_at      BIGINT NOT NULL,
+        expires_at      BIGINT,
+        PRIMARY KEY (tenant_id, idempotency_key)
+      )`,
+      `CREATE INDEX admission_idem_job_idx ON admission_idempotency (tenant_id, job_id)`,
+      `CREATE INDEX admission_idem_state_idx ON admission_idempotency (state, updated_at)`,
+    ],
+  },
+  {
+    // Phase 1F: durable reconciliation watermark + gap registry. The watermark
+    // is the sole durable progress source (no in-memory cursor), so an
+    // interrupted reconciliation run resumes from the last committed boundary
+    // without re-projecting or dropping records.
+    version: 9,
+    name: "reconciliation",
+    statements: [
+      `CREATE TABLE reconciliation_runs (
+        run_id      TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        scope       TEXT NOT NULL,
+        started_at  BIGINT NOT NULL,
+        finished_at BIGINT,
+        status      TEXT NOT NULL,
+        watermark   BIGINT NOT NULL,
+        gaps_found  INTEGER NOT NULL DEFAULT 0,
+        gaps_repaired INTEGER NOT NULL DEFAULT 0,
+        error       TEXT
+      )`,
+      `CREATE INDEX recon_runs_tenant_idx ON reconciliation_runs (tenant_id, started_at)`,
+      `CREATE TABLE reconciliation_gaps (
+        gap_id      TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        ref_type    TEXT NOT NULL,
+        ref_id      TEXT NOT NULL,
+        ref_seq     BIGINT,
+        state       TEXT NOT NULL,
+        detail      TEXT,
+        detected_at BIGINT NOT NULL,
+        repaired_at BIGINT,
+        run_id      TEXT
+      )`,
+      `CREATE UNIQUE INDEX recon_gap_identity_idx ON reconciliation_gaps (tenant_id, kind, ref_type, ref_id, COALESCE(ref_seq, -1))`,
+    ],
+  },
+  {
+    // Phase 1F: snapshot GC retry ledger. A failed provider deletion stays
+    // retryable (state stays 'deleting'); the snapshot is only marked 'deleted'
+    // once the provider confirms (or the design's idempotent-delete contract
+    // allows it). GC never deletes a snapshot required by an active recovery.
+    version: 10,
+    name: "snapshot_gc",
+    statements: [
+      `CREATE TABLE snapshot_gc_attempts (
+        snapshot_id   TEXT PRIMARY KEY REFERENCES snapshot_lifecycle (snapshot_id) ON DELETE CASCADE,
+        tenant_id     TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        last_error    TEXT,
+        last_attempt_at BIGINT,
+        eligible_at   BIGINT NOT NULL,
+        deleted_at    BIGINT
+      )`,
+      `CREATE INDEX snapshot_gc_state_idx ON snapshot_gc_attempts (state, eligible_at)`,
+    ],
+  },
 ]
 
 const LEDGER = `CREATE TABLE IF NOT EXISTS schema_migrations (
-  version INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
+  name TEXT PRIMARY KEY,
+  version INTEGER NOT NULL,
   applied_at BIGINT NOT NULL
 )`
 
 /** Apply pending migrations in version order. Returns applied versions.
  *
  * The migration ledger (`schema_migrations`) is shared across all stores that
- * wrap the same {@link SqlDatabase}: version numbers are globally unique, so a
- * business-layer store may pass its own migration list (Phase 1E) and already
- * applied versions are skipped. This lets durable business state share the
- * execution store's database without duplicating the migration machinery. */
-export function applyMigrations(db: SqlDatabase, migrations: readonly Migration[] = MIGRATIONS): number[] {
+ * wrap the same {@link SqlDatabase}. Migrations are deduplicated by **name**
+ * (globally unique across all packages), NOT by version number: different
+ * packages intentionally use overlapping version numbers (e.g. identity v2
+ * "identity_core" and store-sql v2 "distributed_control_plane"), so version
+ * alone is not a stable identity. A business-layer store may pass its own
+ * migration list (Phase 1E) and already-applied migrations (by name) are
+ * skipped. This lets durable business state share the execution store's
+ * database without duplicating the migration machinery. */
+export function applyMigrations(db: SqlDatabase, migrations: readonly Migration[] = MIGRATIONS, dialect?: import("./driver").SqlDialect): number[] {
+  const param = (sql: string): string => (dialect ? dialect.parameterize(sql) : sql)
   db.exec(LEDGER)
-  const appliedRows = db.prepare("SELECT version FROM schema_migrations").all()
-  const applied = new Set(appliedRows.map((row) => Number(row.version)))
+  const appliedRows = db.prepare(param("SELECT name FROM schema_migrations")).all()
+  const applied = new Set(appliedRows.map((row) => String(row.name)))
   const newlyApplied: number[] = []
   for (const migration of [...migrations].sort((a, b) => a.version - b.version)) {
-    if (applied.has(migration.version)) continue
-    db.exec("BEGIN")
+    if (applied.has(migration.name)) continue
+    db.exec(dialect ? dialect.beginImmediateStatement() : "BEGIN")
     try {
       for (const statement of migration.statements) db.exec(statement)
-      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
-        migration.version,
+      db.prepare(param("INSERT INTO schema_migrations (name, version, applied_at) VALUES (?, ?, ?)")).run(
         migration.name,
+        migration.version,
         Date.now(),
       )
       db.exec("COMMIT")

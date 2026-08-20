@@ -83,6 +83,15 @@ export interface ExecutionPolicy {
   readonly idempotentTools: readonly string[]
   /** Wall-clock lease for a single worker attempt, milliseconds. */
   readonly leaseMs: number
+  /** Phase 1F: soft token budget (input+output+reasoning). Enforcement happens
+   *  at the next safe boundary (after a turn's usage is committed), so overshoot
+   *  is bounded to one provider turn — model usage is only known after a turn.
+   *  null/undefined = no token budget. Checkpoint correctness is never
+   *  sacrificed: the turn's committed usage stays durable and accounted. */
+  readonly maxTokens?: number | null
+  /** Phase 1F: soft wall-clock budget for the whole job, milliseconds. Checked
+   *  at step boundaries (not mid-turn). null/undefined = no duration budget. */
+  readonly maxDurationMs?: number | null
 }
 
 export const DEFAULT_EXECUTION_POLICY: ExecutionPolicy = {
@@ -92,6 +101,18 @@ export const DEFAULT_EXECUTION_POLICY: ExecutionPolicy = {
   allowedTools: [],
   idempotentTools: [],
   leaseMs: 60_000,
+  maxTokens: null,
+  maxDurationMs: null,
+}
+
+/** Reason recorded on a durable budget-exhaustion transition (Phase 1F). */
+export type BudgetExhaustionReason = "token_budget_exhausted" | "duration_budget_exhausted"
+
+export function budgetExhaustionEvent(reason: BudgetExhaustionReason, detail: { consumedTokens: number; maxTokens?: number | null; elapsedMs: number; maxDurationMs?: number | null }): {
+  type: "budget_exhausted"
+  data: { reason: BudgetExhaustionReason; consumedTokens: number; maxTokens?: number | null; elapsedMs: number; maxDurationMs?: number | null }
+} {
+  return { type: "budget_exhausted", data: { reason, ...detail } }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +173,7 @@ export const JOB_EVENT_TYPES = [
   "usage",
   "warning",
   "error",
+  "budget_exhausted",
   "completed",
   "cancelled",
 ] as const

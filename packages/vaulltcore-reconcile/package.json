@@ -1,5 +1,5 @@
 {
-  "name": "@vaulltcore/control",
+  "name": "@vaulltcore/reconcile",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -9,14 +9,9 @@
   "dependencies": {
     "@vaulltcore/runner": "*",
     "@vaulltcore/store-sql": "*",
-    "@vaulltcore/worker": "*",
-    "@vaulltcore/identity": "*",
-    "@vaulltcore/policy": "*",
-    "@vaulltcore/quota": "*",
     "@vaulltcore/metering": "*",
     "@vaulltcore/billing": "*",
-    "@vaulltcore/audit": "*",
-    "@vaulltcore/reconcile": "*"
+    "@vaulltcore/quota": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

@@ -30,7 +30,7 @@ export class SqlStoreBase {
     this.dialect = options.dialect ?? sqliteDialect
     this.dialectName = this.dialect.name
     this.beforeCommit = options.beforeCommit
-    applyMigrations(db, migrations)
+    applyMigrations(db, migrations, this.dialect)
   }
 
   protected readonly beforeCommit?: (op: string) => void

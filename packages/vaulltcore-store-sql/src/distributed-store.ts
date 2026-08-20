@@ -58,11 +58,15 @@ export class DistributedSqlStore {
     this.dialect = options.dialect ?? sqliteDialect
   }
 
-  private prepare(sql: string): SqlStatement {
+  /** Prepare a parameterized statement. Public so co-located drivers (e.g.
+   *  SnapshotGcDriver) can access the GC-attempt table without duplicating the
+   *  dialect/parameterize seam. */
+  prepare(sql: string): SqlStatement {
     return this.db.prepare(this.dialect.parameterize(sql))
   }
 
-  private atomic<T>(fn: () => T): T {
+  /** Run `fn` inside an immediate transaction with rollback on error. */
+  atomic<T>(fn: () => T): T {
     this.db.exec(this.dialect.beginImmediateStatement())
     try {
       const result = fn()

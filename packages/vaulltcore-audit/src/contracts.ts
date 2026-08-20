@@ -63,6 +63,23 @@ export const AUDIT_EVENT_TYPES = [
   "external_mutation",
   "provider_failure",
   "byok_usage",
+  // Phase 2D: connected-product lifecycle. Additive (TEXT-persisted type).
+  // OAuth authorization attempts, connection activation/degradation, trigger
+  // dispatch, and model connection activation all emit durable, sanitized
+  // audit records. No secrets ever appear (sanitizeMetadata strips them).
+  "authorization_started",
+  "authorization_verified",
+  "connection_activated",
+  "connection_degraded",
+  "connection_refreshed",
+  "connection_revoked",
+  "connection_disconnected",
+  "callback_rejected",
+  "trigger_dispatched",
+  "trigger_rejected",
+  "trigger_dead_lettered",
+  "model_connection_activated",
+  "model_connection_deactivated",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

@@ -35,3 +35,6 @@ export {
 } from "./base"
 export { GitHubGitProvider, type GitHubProviderOptions } from "./github"
 export { GitLabGitProvider, type GitLabProviderOptions } from "./gitlab"
+// Phase 2D: OAuth authorization adapters (neutral OAuthProviderAdapter seam).
+export { GitHubOAuthAdapter, type GitHubOAuthAdapterOptions, fingerprintToken } from "./github-oauth"
+export { GitLabOAuthAdapter, type GitLabOAuthAdapterOptions } from "./gitlab-oauth"

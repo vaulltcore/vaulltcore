@@ -21,7 +21,7 @@
  *   source (the connection STATE gates resolve).
  */
 
-import { randomBytes } from "node:crypto"
+import { randomBytes, createHash } from "node:crypto"
 import { SqlStoreBase, isUniqueViolation, type Migration, type SqlDialect, type SqlDatabase } from "@vaulltcore/store-sql"
 import {
   type ConnectionCapability,
@@ -31,6 +31,7 @@ import {
   type ProviderConnection,
   CredentialError,
   PROVIDER_FAMILIES,
+  assertConnectionTransition,
 } from "./contracts"
 
 export const CREDENTIAL_MIGRATIONS: readonly Migration[] = [
@@ -62,6 +63,50 @@ export const CREDENTIAL_MIGRATIONS: readonly Migration[] = [
       )`,
       `CREATE INDEX connections_tenant_idx ON provider_connections (tenant_id, org_id, project_id, family)`,
       `CREATE INDEX connections_state_idx ON provider_connections (tenant_id, state)`,
+    ],
+  },
+  // Phase 2D: OAuth authorization attempts. The `state` nonce is single-use
+  // (UNIQUE + consumed at settlement); it is bound durably to
+  // tenant/org/project/principal/provider BEFORE the redirect, so a forged
+  // callback cannot select another tenant's connection or replay an old state.
+  // No access/refresh token or client secret is ever stored here: only the
+  // PKCE challenge (one-way), requested scopes, redirect URI, and the eventual
+  // opaque secret ref + fingerprint (after the secret has crossed the
+  // SecretProvider boundary). The verifier is deleted at settlement.
+  {
+    version: 3,
+    name: "oauth_attempts",
+    statements: [
+      `CREATE TABLE authorization_attempts (
+        attempt_id          TEXT PRIMARY KEY,
+        state               TEXT NOT NULL UNIQUE,
+        tenant_id           TEXT NOT NULL,
+        org_id              TEXT NOT NULL,
+        project_id          TEXT NOT NULL,
+        principal_id        TEXT NOT NULL,
+        provider            TEXT NOT NULL,
+        family              TEXT NOT NULL,
+        method              TEXT NOT NULL,
+        connection_id       TEXT,
+        code_challenge      TEXT,
+        code_verifier       TEXT,
+        scopes              TEXT NOT NULL,
+        redirect_uri        TEXT NOT NULL,
+        created_at          BIGINT NOT NULL,
+        expires_at          BIGINT NOT NULL,
+        outcome_state       TEXT,
+        outcome_secret_ref  TEXT,
+        outcome_secret_fingerprint TEXT,
+        outcome_account_external_id TEXT,
+        outcome_account_display TEXT,
+        outcome_account_scopes TEXT,
+        outcome_refresh_secret_ref TEXT,
+        outcome_expires_at  BIGINT,
+        settled_at          BIGINT,
+        UNIQUE (tenant_id, state)
+      )`,
+      `CREATE INDEX attempts_tenant_idx ON authorization_attempts (tenant_id, expires_at)`,
+      `CREATE INDEX attempts_connection_idx ON authorization_attempts (tenant_id, connection_id)`,
     ],
   },
 ]
@@ -277,6 +322,18 @@ export class SqlCredentialStore extends SqlStoreBase {
     return this.setState(tenantId, connectionId, expectedVersion, "disconnected")
   }
 
+  /** Mark a connection degraded (credentials failing but not definitively
+   *  revoked — e.g. a refresh failure). Fenced by version CAS. */
+  async markDegraded(tenantId: string, connectionId: string, expectedVersion: number): Promise<ProviderConnection> {
+    return this.setState(tenantId, connectionId, expectedVersion, "degraded")
+  }
+
+  /** Reactivate a degraded/expired connection after a successful refresh /
+   *  reauthorization. Fenced by version CAS; validates the transition. */
+  async activate(tenantId: string, connectionId: string, expectedVersion: number): Promise<ProviderConnection> {
+    return this.setState(tenantId, connectionId, expectedVersion, "active")
+  }
+
   /** Mark a connection expired (idempotent; reaper-safe). */
   async markExpired(tenantId: string, connectionId: string): Promise<ProviderConnection | null> {
     const existing = await this.get(tenantId, connectionId)
@@ -311,7 +368,12 @@ export class SqlCredentialStore extends SqlStoreBase {
     expectedVersion: number,
     state: ConnectionState,
   ): Promise<ProviderConnection> {
-    return this.fencedUpdate(tenantId, connectionId, expectedVersion, () => ({ state }), state)
+    return this.fencedUpdate(tenantId, connectionId, expectedVersion, (row) => {
+      // Validate the transition deterministically (illegal paths fail, never
+      // silently coerce). The CAS below still guards concurrent writers.
+      assertConnectionTransition(row.state as ConnectionState, state)
+      return { state }
+    }, state)
   }
 
   private fencedUpdate(

@@ -16,6 +16,6 @@ export type {
   WebhookRouteResolver,
   QuarantinedRawEvent,
 } from "./contracts"
-export { SqlWebhookStore, type SqlWebhookStoreOptions } from "./store"
+export { SqlWebhookStore, type SqlWebhookStoreOptions, redactHeaders } from "./store"
 export { WebhookGateway, type WebhookGatewayOptions } from "./gateway"
 export { SubscriptionMatcher, globMatch, type Subscription, type TriggerRequest } from "./fanout"

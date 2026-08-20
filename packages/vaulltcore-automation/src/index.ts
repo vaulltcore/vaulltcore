@@ -45,3 +45,31 @@ export {
   type DispatchStepResult,
   approverRoleRank,
 } from "./service"
+// Phase 2D: durable trigger model + trigger→run dispatch.
+export {
+  TRIGGER_CLASSES,
+  TRIGGER_STATES,
+  type TriggerClass,
+  type TriggerState,
+  type TriggerMatchCriteria,
+  type TriggerDefinition,
+  type PublishTriggerInput,
+  triggerChecksum,
+} from "./trigger"
+export {
+  SqlTriggerStore,
+  TRIGGER_MIGRATIONS,
+  DISPATCH_STATES,
+  TERMINAL_DISPATCH_STATES,
+  type DispatchState,
+  type DispatchRejectionKind,
+  type TriggerDispatch,
+  type TriggerStoreOptions,
+} from "./trigger-store"
+export {
+  TriggerDispatchService,
+  type TriggerDispatchServiceOptions,
+  type TriggerRunSink,
+  type TriggerRunRejection,
+  type DispatchEventResult,
+} from "./dispatch"

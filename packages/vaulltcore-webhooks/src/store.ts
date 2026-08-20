@@ -122,6 +122,22 @@ export class SqlWebhookStore extends SqlStoreBase {
     })
   }
 
+  /** List enqueued events not yet processed (Phase 2D dispatch input).
+   *  Ordered by enqueue time so a worker drains in arrival order. */
+  listEnqueued(tenantId: string, limit = 100): WebhookEventRecord[] {
+    const rows = this.prepare(`SELECT * FROM webhook_events WHERE tenant_id = ? AND state = 'accepted' AND enqueued_at IS NOT NULL ORDER BY enqueued_at ASC LIMIT ?`)
+      .all(tenantId, limit).map(rowToRecord)
+    return rows
+  }
+
+  /** Mark an enqueued event processed (dispatch attempted). */
+  markProcessed(tenantId: string, eventId: string): void {
+    this.atomic("markProcessed", () => {
+      this.prepare(`UPDATE webhook_events SET state = 'processed' WHERE tenant_id = ? AND event_id = ? AND state = 'accepted'`)
+        .run(tenantId, eventId)
+    })
+  }
+
   /** Transition state (fenced: only accepted→dead_lettered/processed). */
   transition(tenantId: string, eventId: string, to: WebhookEventState, reason: string | null = null): void {
     this.atomic("transition", () => {
@@ -142,11 +158,25 @@ export class SqlWebhookStore extends SqlStoreBase {
       .all(tenantId, limit).map(rowToRecord)
   }
 
-  /** Quarantine a raw event that failed normalization (forensics). */
+  /** Quarantine a raw event that failed normalization (forensics).
+   *  Authorization/signature/cookie headers are redacted so a credential
+   *  or signing secret can never leak into the quarantine bucket. */
   quarantine(raw: QuarantinedRawEvent): void {
     this.atomic("quarantine", () => {
       this.prepare(`INSERT INTO webhook_quarantine (id, tenant_id, provider, raw_body, headers, reason, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-        .run(raw.id, raw.tenantId, raw.provider, raw.rawBody, JSON.stringify(raw.headers), raw.reason, raw.receivedAt)
+        .run(raw.id, raw.tenantId, raw.provider, raw.rawBody, JSON.stringify(redactHeaders(raw.headers)), raw.reason, raw.receivedAt)
     })
   }
+}
+
+/** Redact credential/signature-bearing headers before raw payload storage so
+ *  no secret crosses into the quarantine/forensics bucket. Signature headers
+ *  are redacted too (conservative — they are HMAC outputs, not secrets). */
+const REDACT_HEADER_KEYS = /^(authorization|x-hub-signature(-256)?|x-slack-signature|x-github-token|x-api-key|cookie|set-cookie)$/i
+export function redactHeaders(headers: Readonly<Record<string, string>>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    out[key] = REDACT_HEADER_KEYS.test(key) ? "[redacted]" : value
+  }
+  return out
 }

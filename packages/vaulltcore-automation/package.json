@@ -10,7 +10,8 @@
     "@vaulltcore/runner": "*",
     "@vaulltcore/store-sql": "*",
     "@vaulltcore/identity": "*",
-    "@vaulltcore/audit": "*"
+    "@vaulltcore/audit": "*",
+    "@vaulltcore/integration": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

@@ -20,3 +20,6 @@ export type {
 } from "./pm"
 export { LinearProvider, type LinearProviderOptions } from "./linear"
 export { SlackConnector, type SlackConnectorOptions, type ChannelMapping } from "./slack"
+// Phase 2D: OAuth authorization adapters (neutral OAuthProviderAdapter seam).
+export { LinearOAuthAdapter, type LinearOAuthAdapterOptions } from "./linear-oauth"
+export { SlackOAuthAdapter, type SlackOAuthAdapterOptions } from "./slack-oauth"

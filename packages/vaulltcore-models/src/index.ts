@@ -38,3 +38,11 @@ export {
   customOpenAICompatibleDescriptor,
   BUILTIN_DESCRIPTORS,
 } from "./catalog"
+// Phase 2D: model connection activation service (BYOK verify/activate/health).
+export {
+  ModelConnectionService,
+  type ModelConnectionServiceOptions,
+  type ModelConnectionView,
+  type RegisterModelConnectionInput,
+  type VerifyConnectivityResult,
+} from "./connection-service"

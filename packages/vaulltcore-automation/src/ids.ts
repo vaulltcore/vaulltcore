@@ -17,6 +17,9 @@ export const newArtifactId = (): string => "art_" + ascending()
 export const newApprovalId = (): string => "apr_" + ascending()
 export const newDeliveryId = (): string => "dlv_" + ascending()
 export const newMappingId = (): string => "map_" + ascending()
+// Phase 2D: trigger + dispatch identity.
+export const newTriggerId = (): string => "trg_" + ascending()
+export const newDispatchId = (): string => "dsp_" + ascending()
 
 /** Deterministic idempotency key for a (run, step) job creation. A restart
  *  re-derives the same key, so the admission pipeline's idempotency registry

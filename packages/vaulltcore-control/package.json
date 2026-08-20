@@ -19,7 +19,13 @@
     "@vaulltcore/reconcile": "*",
     "@vaulltcore/automation": "*",
     "@vaulltcore/scheduler": "*",
-    "@vaulltcore/ops": "*"
+    "@vaulltcore/ops": "*",
+    "@vaulltcore/credentials": "*",
+    "@vaulltcore/integration": "*",
+    "@vaulltcore/git": "*",
+    "@vaulltcore/connectors": "*",
+    "@vaulltcore/models": "*",
+    "@vaulltcore/webhooks": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

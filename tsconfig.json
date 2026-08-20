@@ -18,6 +18,12 @@
     { "path": "packages/vaulltcore-delivery" },
     { "path": "packages/vaulltcore-ops" },
     { "path": "packages/vaulltcore-scheduler" },
-    { "path": "packages/vaulltcore-recovery" }
+    { "path": "packages/vaulltcore-recovery" },
+    { "path": "packages/vaulltcore-credentials" },
+    { "path": "packages/vaulltcore-integration" },
+    { "path": "packages/vaulltcore-git" },
+    { "path": "packages/vaulltcore-connectors" },
+    { "path": "packages/vaulltcore-models" },
+    { "path": "packages/vaulltcore-webhooks" }
   ]
 }

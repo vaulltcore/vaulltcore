@@ -50,6 +50,19 @@ export const AUDIT_EVENT_TYPES = [
   "automation_delivery_completed",
   // Phase 2B: operational recovery. Additive (TEXT-persisted type).
   "automation_recovery_scan",
+  // Phase 2C: integration lifecycle. Additive (TEXT-persisted type). Every
+  // important integration lifecycle action produces a durable audit record;
+  // secrets are stripped by sanitizeMetadata before write.
+  "integration_connected",
+  "integration_disconnected",
+  "integration_revoked",
+  "integration_rotated",
+  "integration_credential_refreshed",
+  "webhook_accepted",
+  "webhook_rejected",
+  "external_mutation",
+  "provider_failure",
+  "byok_usage",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

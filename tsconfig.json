@@ -11,6 +11,7 @@
     { "path": "packages/vaulltcore-metering" },
     { "path": "packages/vaulltcore-billing" },
     { "path": "packages/vaulltcore-audit" },
+    { "path": "packages/vaulltcore-reconcile" },
     { "path": "packages/vaulltcore-control" }
   ]
 }

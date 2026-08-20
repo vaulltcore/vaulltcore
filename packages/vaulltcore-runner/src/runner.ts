@@ -21,6 +21,7 @@ import type {
   AgentEngine,
   AgentRunner,
   ActorHandle,
+  BudgetExhaustionReason,
   ChatMessage,
   CreateJobInput,
   EngineSession,
@@ -480,6 +481,19 @@ export class DurableAgentRunner implements AgentRunner {
       draft.lastCompletedStep = { stepIndex, finishedAt: Date.now() }
       draft.pendingInput = []
 
+      // Phase 1F: runtime economic enforcement at a SAFE boundary. Model usage
+      // is only known after a completed provider turn, so token/duration budgets
+      // are checked here — after the turn's usage is durably committed but before
+      // the next step begins. Overshoot is bounded to one provider turn. On
+      // exhaustion the job transitions through a durable, explainable state
+      // (budget_exhausted event + cancelled) preserving the checkpoint boundary;
+      // the already-consumed resources stay durably accounted. Checkpoint
+      // correctness is NEVER sacrificed to enforce billing/quota.
+      const budgetHit = this.checkBudgets(record, draft, policy)
+      if (budgetHit) {
+        return this.finalizeBudgetExhausted(await this.requireRecord(record.jobId), draft, workspace, budgetHit)
+      }
+
       if (toolCalls.length === 0) {
         draft.continuation = { type: "done" }
         return this.completeJob(await this.requireRecord(record.jobId), draft, workspace)
@@ -693,6 +707,69 @@ export class DurableAgentRunner implements AgentRunner {
       draft.status = "cancelled"
       await this.commitBoundary(record, draft, "cancelled").catch(() => {})
     }
+    const next = await this.store
+      .updateJobRecord(record.jobId, record.attempt, () => ({ status: "cancelled" as JobStatus, leaseToken: null, leaseExpiresAt: null }))
+      .catch(() => ({ ...record, status: "cancelled" as JobStatus }))
+    await this.disposeEnvironment(record.jobId, workspace)
+    return this.toState(next)
+  }
+
+  /**
+   * Phase 1F: evaluate token/duration budgets at a safe boundary. Returns the
+   * exhaustion reason if a budget is exceeded, or null to continue. Token usage
+   * is only known after a completed turn (bounded overshoot = one turn); the
+   * turn's usage is already committed to `draft.usage` before this is called, so
+   * accounting is preserved regardless of the outcome. Duration is measured from
+   * the attempt start (`draft.createdAt`).
+   */
+  private checkBudgets(
+    _record: JobRecord,
+    draft: Draft,
+    policy: ExecutionPolicy,
+  ): BudgetExhaustionReason | null {
+    const maxTokens = policy.maxTokens ?? null
+    if (maxTokens !== null && draft.usage.totalTokens >= maxTokens) {
+      return "token_budget_exhausted"
+    }
+    const maxDurationMs = policy.maxDurationMs ?? null
+    if (maxDurationMs !== null && Date.now() - draft.createdAt >= maxDurationMs) {
+      return "duration_budget_exhausted"
+    }
+    return null
+  }
+
+  /**
+   * Phase 1F: durable budget-exhaustion transition. Emits a `budget_exhausted`
+   * event carrying the reason + consumed resources, then finalizes as
+   * `cancelled` through the SAME durable commit boundary as a normal
+   * cancellation — so the checkpoint, committed usage, and continuation are all
+   * preserved for reconciliation/recovery. The job is NOT silently killed: its
+   * accounting for already-consumed resources stays durable and billable.
+   */
+  private async finalizeBudgetExhausted(
+    record: JobRecord,
+    draft: Draft,
+    workspace: WorkspaceHandle | null,
+    reason: BudgetExhaustionReason,
+  ): Promise<JobState> {
+    const policy = this.policyFor(record)
+    const elapsedMs = Date.now() - draft.createdAt
+    await this.append(record.jobId, [
+      {
+        jobId: record.jobId,
+        timestamp: Date.now(),
+        type: "budget_exhausted",
+        data: {
+          reason,
+          consumedTokens: draft.usage.totalTokens,
+          maxTokens: policy.maxTokens ?? null,
+          elapsedMs,
+          maxDurationMs: policy.maxDurationMs ?? null,
+        },
+      },
+    ])
+    draft.status = "cancelled"
+    await this.commitBoundary(record, draft, "cancelled").catch(() => {})
     const next = await this.store
       .updateJobRecord(record.jobId, record.attempt, () => ({ status: "cancelled" as JobStatus, leaseToken: null, leaseExpiresAt: null }))
       .catch(() => ({ ...record, status: "cancelled" as JobStatus }))

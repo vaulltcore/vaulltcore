@@ -20,6 +20,10 @@ import {
   type LedgerEntry,
   type LedgerEntryType,
   type PricingVersion,
+  type SettleUsageInput,
+  type SettleUsageResult,
+  type UsageSettlement,
+  type SettlementState,
   BillingError,
 } from "./contracts"
 
@@ -54,6 +58,42 @@ export const BILLING_MIGRATIONS: readonly Migration[] = [
       )`,
       `CREATE INDEX ledger_scope_idx ON ledger_entries (tenant_id, org_id, project_id)`,
       `CREATE INDEX ledger_job_idx ON ledger_entries (tenant_id, job_id)`,
+    ],
+  },
+  {
+    // Phase 1F: durable usage→ledger settlement tracking. Each usage event is
+    // settled exactly once: the (tenant_id, event_id) PRIMARY KEY + state
+    // machine guarantee one authoritative outcome. Pricing is resolved against
+    // an immutable PricingVersion referenced by id+version; a later price change
+    // can never rewrite a settled entry. If pricing cannot be resolved, the
+    // event is marked `unresolved` (durable, surfaced to reconciliation) — never
+    // silently dropped. `non_billable` carries a durable reason.
+    version: 11,
+    name: "usage_settlement",
+    statements: [
+      `CREATE TABLE usage_settlement (
+        tenant_id       TEXT NOT NULL,
+        event_id        TEXT NOT NULL,
+        job_id          TEXT NOT NULL,
+        org_id          TEXT NOT NULL,
+        project_id      TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        quantity        INTEGER NOT NULL,
+        state           TEXT NOT NULL,
+        pricing_id      TEXT,
+        pricing_version TEXT,
+        ledger_entry_id TEXT,
+        amount_micro    INTEGER,
+        non_billable_reason TEXT,
+        settled_at      INTEGER,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        last_error      TEXT,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, event_id)
+      )`,
+      `CREATE INDEX usage_settlement_state_idx ON usage_settlement (tenant_id, state)`,
+      `CREATE INDEX usage_settlement_job_idx ON usage_settlement (tenant_id, job_id)`,
     ],
   },
 ]
@@ -291,5 +331,185 @@ export class SqlBillingStore extends SqlStoreBase {
       }
     }
     return { tenantId: scope.tenantId, orgId: scope.orgId, projectId: scope.projectId, balance, charges, credits }
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 1F: durable usage→ledger settlement
+  // -------------------------------------------------------------------------
+
+  /**
+   * Settle one usage event through the durable pipeline:
+   *
+   *   classify billable/non-billable → resolve immutable PricingVersion
+   *   → calculate charge → create exactly one LedgerEntry → mark settled
+   *
+   * Idempotent: the (tenant_id, event_id) PRIMARY KEY + the ledger's
+   * UNIQUE(tenant_id,org_id,project_id,idempotency_key) collapse duplicate
+   * deliveries/retries to one outcome. Pricing is resolved against the ACTIVE
+   * PricingVersion at settlement time and recorded immutably; a later price
+   * change never rewrites a settled entry (corrections are NEW adjustment
+   * entries). If pricing cannot be resolved, the event is marked `unresolved`
+   * (durable, surfaced to reconciliation) — never silently dropped.
+   *
+   * `classify` lets the caller decide billable vs non-billable (e.g. a
+   * cancellation settles only genuinely consumed resources). Returning
+   * `{ billable: false, reason }` marks the event `non_billable` with a durable
+   * reason and creates no charge.
+   */
+  async settleUsage(
+    input: SettleUsageInput,
+    options: {
+      classify?: (input: SettleUsageInput) => { billable: true } | { billable: false; reason: string }
+    } = {},
+  ): Promise<SettleUsageResult> {
+    const now = Date.now()
+    return this.atomic("settleUsage", (): SettleUsageResult => {
+      // Upsert a pending settlement row (idempotent on (tenant, event)).
+      this.prepare(
+        `INSERT INTO usage_settlement (tenant_id, event_id, job_id, org_id, project_id, kind, quantity, state, pricing_id, pricing_version, ledger_entry_id, amount_micro, non_billable_reason, settled_at, attempts, last_error, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, ?, ?)
+         ON CONFLICT (tenant_id, event_id) DO NOTHING`,
+      ).run(input.tenantId, input.eventId, input.jobId, input.orgId, input.projectId, input.kind, input.quantity, now, now)
+      const existing = this.getSettlementRow(input.tenantId, input.eventId)!
+
+      // Terminal states are idempotent: return the recorded outcome.
+      if (existing.state === "settled" || existing.state === "non_billable") {
+        const ledger = existing.ledger_entry_id ? this.prepare("SELECT * FROM ledger_entries WHERE entry_id = ?").get(existing.ledger_entry_id) as unknown as LedgerRow | undefined : undefined
+        return { settlement: toSettlement(existing), ledgerEntry: ledger ? toEntry(ledger) : null, duplicated: true }
+      }
+
+      // Bump attempt counter on every (re)try of a non-terminal event.
+      this.prepare("UPDATE usage_settlement SET attempts = attempts + 1, updated_at = ? WHERE tenant_id = ? AND event_id = ?").run(now, input.tenantId, input.eventId)
+
+      // Classification: default billable.
+      const classification = options.classify ? options.classify(input) : { billable: true } as const
+      if (!classification.billable) {
+        this.prepare(
+          "UPDATE usage_settlement SET state = 'non_billable', non_billable_reason = ?, settled_at = ?, updated_at = ? WHERE tenant_id = ? AND event_id = ?",
+        ).run(classification.reason, now, now, input.tenantId, input.eventId)
+        const settled = this.getSettlementRow(input.tenantId, input.eventId)!
+        return { settlement: toSettlement(settled), ledgerEntry: null, duplicated: false }
+      }
+
+      // Resolve pricing. No active pricing → unresolved (durable, retryable).
+      const pricing = this.prepare("SELECT * FROM pricing_versions WHERE active = 1").get() as unknown as PricingRow | undefined
+      if (!pricing) {
+        this.prepare(
+          "UPDATE usage_settlement SET state = 'unresolved', last_error = ?, updated_at = ? WHERE tenant_id = ? AND event_id = ?",
+        ).run("no active pricing version", now, input.tenantId, input.eventId)
+        const unresolved = this.getSettlementRow(input.tenantId, input.eventId)!
+        return { settlement: toSettlement(unresolved), ledgerEntry: null, duplicated: false }
+      }
+      const unitPrice = (JSON.parse(pricing.unit_prices) as Record<UsageKind, number>)[input.kind] ?? 0
+      const amount = unitPrice * input.quantity
+
+      // Create exactly one ledger entry (idempotent on idempotency_key).
+      const idempotencyKey = `settle:${input.tenantId}:${input.eventId}`
+      const entryId = `led_${randomBytes(12).toString("base64url")}`
+      const chargeResult = this.prepare(
+        `INSERT INTO ledger_entries (entry_id, tenant_id, org_id, project_id, job_id, type, amount, pricing_id, pricing_version, source_ref, idempotency_key, created_at)
+         VALUES (?, ?, ?, ?, ?, 'charge', ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tenant_id, org_id, project_id, idempotency_key) DO NOTHING`,
+      ).run(entryId, input.tenantId, input.orgId, input.projectId, input.jobId, amount, pricing.pricing_id, pricing.version, input.eventId, idempotencyKey, now)
+      let ledger: LedgerRow
+      let duplicated: boolean
+      if (chargeResult.changes === 0) {
+        ledger = this.prepare("SELECT * FROM ledger_entries WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND idempotency_key = ?").get(input.tenantId, input.orgId, input.projectId, idempotencyKey) as unknown as LedgerRow
+        duplicated = true
+      } else {
+        ledger = this.prepare("SELECT * FROM ledger_entries WHERE entry_id = ?").get(entryId) as unknown as LedgerRow
+        duplicated = false
+      }
+
+      // Mark settled, pinning the immutable pricing reference + ledger link.
+      this.prepare(
+        "UPDATE usage_settlement SET state = 'settled', pricing_id = ?, pricing_version = ?, ledger_entry_id = ?, amount_micro = ?, settled_at = ?, last_error = NULL, updated_at = ? WHERE tenant_id = ? AND event_id = ?",
+      ).run(ledger.pricing_id, ledger.pricing_version, ledger.entry_id, ledger.amount, now, now, input.tenantId, input.eventId)
+      const settled = this.getSettlementRow(input.tenantId, input.eventId)!
+      return { settlement: toSettlement(settled), ledgerEntry: toEntry(ledger), duplicated }
+    })
+  }
+
+  /** Mark a usage event durably unresolved (pricing/operator issue). */
+  async markUsageUnresolved(tenantId: string, eventId: string, reason: string): Promise<UsageSettlement | null> {
+    const now = Date.now()
+    return this.atomic("markUsageUnresolved", (): UsageSettlement | null => {
+      const row = this.getSettlementRow(tenantId, eventId)
+      if (!row) return null
+      if (row.state === "settled" || row.state === "non_billable") return toSettlement(row)
+      this.prepare("UPDATE usage_settlement SET state = 'unresolved', last_error = ?, updated_at = ? WHERE tenant_id = ? AND event_id = ?").run(reason, now, tenantId, eventId)
+      return toSettlement(this.getSettlementRow(tenantId, eventId)!)
+    })
+  }
+
+  /** Retry a previously-unresolved settlement now that pricing may exist. */
+  async retrySettlement(input: SettleUsageInput, options: { classify?: (input: SettleUsageInput) => { billable: true } | { billable: false; reason: string } } = {}): Promise<SettleUsageResult> {
+    return this.settleUsage(input, options)
+  }
+
+  /** Read a settlement record (no transition). */
+  getUsageSettlement(tenantId: string, eventId: string): UsageSettlement | null {
+    const row = this.getSettlementRow(tenantId, eventId)
+    return row ? toSettlement(row) : null
+  }
+
+  /** All settlement records for a job (tenant-scoped). */
+  listJobSettlements(tenantId: string, jobId: string): UsageSettlement[] {
+    const rows = this.prepare("SELECT * FROM usage_settlement WHERE tenant_id = ? AND job_id = ? ORDER BY created_at ASC").all(tenantId, jobId) as unknown as SettlementRow[]
+    return rows.map(toSettlement)
+  }
+
+  /** Settlement records in a given state (backlog inspection). */
+  listSettlementsByState(tenantId: string, state: SettlementState): UsageSettlement[] {
+    const rows = this.prepare("SELECT * FROM usage_settlement WHERE tenant_id = ? AND state = ? ORDER BY updated_at ASC").all(tenantId, state) as unknown as SettlementRow[]
+    return rows.map(toSettlement)
+  }
+
+  private getSettlementRow(tenantId: string, eventId: string): SettlementRow | null {
+    return (this.prepare("SELECT * FROM usage_settlement WHERE tenant_id = ? AND event_id = ?").get(tenantId, eventId) as unknown as SettlementRow | undefined) ?? null
+  }
+}
+
+interface SettlementRow {
+  tenant_id: string
+  event_id: string
+  job_id: string
+  org_id: string
+  project_id: string
+  kind: string
+  quantity: number
+  state: string
+  pricing_id: string | null
+  pricing_version: string | null
+  ledger_entry_id: string | null
+  amount_micro: number | null
+  non_billable_reason: string | null
+  settled_at: number | null
+  attempts: number
+  last_error: string | null
+  created_at: number
+  updated_at: number
+}
+
+function toSettlement(row: SettlementRow): UsageSettlement {
+  return {
+    tenantId: row.tenant_id,
+    eventId: row.event_id,
+    jobId: row.job_id,
+    orgId: row.org_id,
+    projectId: row.project_id,
+    kind: row.kind as UsageKind,
+    quantity: row.quantity,
+    state: row.state as SettlementState,
+    pricingId: row.pricing_id,
+    pricingVersion: row.pricing_version,
+    ledgerEntryId: row.ledger_entry_id,
+    amountMicro: row.amount_micro,
+    nonBillableReason: row.non_billable_reason,
+    settledAt: row.settled_at,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   }
 }

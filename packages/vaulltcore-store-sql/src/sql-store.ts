@@ -38,11 +38,12 @@ import {
   type JobEvent,
   type JobEventType,
   type JobRecord,
+  type JobStatus,
   type LeaseGrant,
   type NewJobEvent,
 } from "@vaulltcore/runner"
 import type { LeaseRenewalResult } from "@vaulltcore/runner"
-import { applyMigrations } from "./migrations"
+import { applyMigrations, MIGRATIONS } from "./migrations"
 import { sqliteDialect, type SqlDatabase, type SqlDialect, type SqlStatement } from "./driver"
 
 export interface SqlJobStoreHooks {
@@ -95,7 +96,7 @@ export class SqlJobStore implements DurableJobStore {
   ) {
     this.dialect = options.dialect ?? sqliteDialect
     this.dialectName = this.dialect.name
-    applyMigrations(this.db)
+    applyMigrations(this.db, MIGRATIONS, this.dialect)
   }
 
   /** Escape hatch for infrastructure concerns (tests, ops tooling). The
@@ -379,6 +380,29 @@ export class SqlJobStore implements DurableJobStore {
       timestamp: row.timestamp,
       type: row.type,
       data: JSON.parse(row.data) as unknown,
+    }))
+  }
+
+  /**
+   * Tenant-scoped job index for reconciliation/ops (Phase 1F). Returns job ids
+   * + identity + status + last committed seq for a tenant. Read-only and
+   * tenant-scoped: there is no path that returns another tenant's jobs. The
+   * reconciler uses this to enumerate authoritative execution state without
+   * touching the runner's execution path.
+   */
+  async listJobsByTenant(tenantId: string): Promise<Array<{ jobId: string; tenantId: string; orgId: string; projectId: string; status: JobStatus; lastSeq: number; createdAt: number; updatedAt: number }>> {
+    const rows = this.prepare(
+      "SELECT job_id, tenant_id, org_id, project_id, status, last_seq, created_at, updated_at FROM jobs WHERE tenant_id = ? ORDER BY created_at ASC",
+    ).all(tenantId) as Array<{ job_id: string; tenant_id: string; org_id: string; project_id: string; status: string; last_seq: number; created_at: number; updated_at: number }>
+    return rows.map((row) => ({
+      jobId: row.job_id,
+      tenantId: row.tenant_id,
+      orgId: row.org_id,
+      projectId: row.project_id,
+      status: row.status as JobStatus,
+      lastSeq: row.last_seq,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
     }))
   }
 

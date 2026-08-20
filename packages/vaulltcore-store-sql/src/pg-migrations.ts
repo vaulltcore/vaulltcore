@@ -12,8 +12,8 @@ import type { Pool } from "pg"
 import { MIGRATIONS } from "./migrations"
 
 const LEDGER = `CREATE TABLE IF NOT EXISTS schema_migrations (
-  version INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
+  name TEXT PRIMARY KEY,
+  version INTEGER NOT NULL,
   applied_at BIGINT NOT NULL
 )`
 
@@ -24,22 +24,25 @@ function idempotent(stmt: string): string {
   return stmt
 }
 
-/** Apply pending migrations to a PostgreSQL pool. Returns applied versions. */
+/** Apply pending migrations to a PostgreSQL pool. Returns applied versions.
+ *
+ * Migrations are deduplicated by **name** (globally unique), not version
+ * number — see {@link applyMigrations} in migrations.ts for rationale. */
 export async function applyMigrationsPg(pool: Pool): Promise<number[]> {
   await pool.query(LEDGER)
-  const { rows } = await pool.query("SELECT version FROM schema_migrations")
-  const applied = new Set(rows.map((r) => Number(r.version)))
+  const { rows } = await pool.query("SELECT name FROM schema_migrations")
+  const applied = new Set(rows.map((r) => String(r.name)))
   const newlyApplied: number[] = []
   for (const migration of [...MIGRATIONS].sort((a, b) => a.version - b.version)) {
-    if (applied.has(migration.version)) continue
+    if (applied.has(migration.name)) continue
     const client = await pool.connect()
     try {
       await client.query("BEGIN")
       try {
         for (const statement of migration.statements) await client.query(idempotent(statement))
-        await client.query("INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1,$2,$3)", [
-          migration.version,
+        await client.query("INSERT INTO schema_migrations (name, version, applied_at) VALUES ($1,$2,$3)", [
           migration.name,
+          migration.version,
           Date.now(),
         ])
         await client.query("COMMIT")

@@ -85,3 +85,59 @@ export interface AccountBalance {
   readonly charges: number
   readonly credits: number
 }
+
+/**
+ * Settlement state machine for a usage event (Phase 1F).
+ *
+ *   pending → priced → settled      (billable: priced + ledger entry created)
+ *   pending → non_billable          (durable reason; no charge)
+ *   pending → unresolved            (pricing could not be resolved; durable,
+ *                                    surfaced to reconciliation; retryable)
+ *
+ * `settled` and `non_billable` are terminal-success outcomes. `unresolved` is
+ * retryable: a later pricing change or operator action can move it to
+ * `priced`/`settled`. History is immutable — a re-pricing after settlement is a
+ * NEW adjustment ledger entry, never a mutation of the original.
+ */
+export const SETTLEMENT_STATES = ["pending", "priced", "settled", "non_billable", "unresolved"] as const
+export type SettlementState = (typeof SETTLEMENT_STATES)[number]
+
+/** A durable usage→ledger settlement record. */
+export interface UsageSettlement {
+  readonly tenantId: string
+  readonly eventId: string
+  readonly jobId: string
+  readonly orgId: string
+  readonly projectId: string
+  readonly kind: UsageKind
+  readonly quantity: number
+  readonly state: SettlementState
+  readonly pricingId: string | null
+  readonly pricingVersion: string | null
+  readonly ledgerEntryId: string | null
+  readonly amountMicro: number | null
+  readonly nonBillableReason: string | null
+  readonly settledAt: number | null
+  readonly attempts: number
+  readonly lastError: string | null
+  readonly createdAt: number
+  readonly updatedAt: number
+}
+
+/** Input to settle a single usage event. */
+export interface SettleUsageInput {
+  readonly tenantId: string
+  readonly eventId: string
+  readonly jobId: string
+  readonly orgId: string
+  readonly projectId: string
+  readonly kind: UsageKind
+  readonly quantity: number
+}
+
+/** Outcome of settling one usage event. */
+export interface SettleUsageResult {
+  readonly settlement: UsageSettlement
+  readonly ledgerEntry: LedgerEntry | null
+  readonly duplicated: boolean
+}

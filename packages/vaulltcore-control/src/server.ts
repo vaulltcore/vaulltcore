@@ -26,6 +26,8 @@ import type { SqlQuotaStore } from "@vaulltcore/quota"
 import type { SqlMeteringStore } from "@vaulltcore/metering"
 import type { SqlBillingStore } from "@vaulltcore/billing"
 import type { SqlAuditStore } from "@vaulltcore/audit"
+import { ReconciliationService, type JobIndex, type ReconciliationDeps } from "@vaulltcore/reconcile"
+import type { SnapshotGcDriver } from "@vaulltcore/store-sql"
 
 export interface ControlPlaneOptions {
   readonly runner: AgentRunner
@@ -53,6 +55,13 @@ export interface BusinessLayerOptions {
    *  When set, the control plane authenticates via the identity store. */
   readonly apiKeyAuthenticator?: (secret: string) => Promise<ResolvedPrincipal | null>
   readonly admissionIdempotency?: import("./admission").AdmissionIdempotencyRegistry
+  /** Phase 1F: tenant-scoped job index (satisfied by SqlJobStore.listJobsByTenant).
+   *  Required for reconciliation/operations endpoints. */
+  readonly jobs?: JobIndex
+  /** Phase 1F: durable reconciliation store. Required for reconciliation endpoints. */
+  readonly reconciliationStore?: ReconciliationDeps["store"]
+  /** Phase 1F: snapshot GC driver. Required for snapshot GC operations endpoints. */
+  readonly snapshotGc?: SnapshotGcDriver
 }
 
 interface CreateJobRequestBody {
@@ -118,6 +127,11 @@ export class ControlPlane {
     this.add("GET", "/organizations/:orgId/projects/:projectId/usage", this.getProjectUsage)
     this.add("GET", "/organizations/:orgId/projects/:projectId/ledger", this.getProjectLedger)
     this.add("GET", "/organizations/:orgId/projects/:projectId/audit", this.getProjectAudit)
+    // Phase 1F: operational health + reconciliation (tenant-scoped).
+    this.add("POST", "/reconcile", this.triggerReconcile)
+    this.add("GET", "/reconcile/health", this.reconcileHealth)
+    this.add("GET", "/operations/health", this.operationsHealth)
+    this.add("POST", "/operations/snapshot-gc", this.triggerSnapshotGc)
   }
 
   private add(method: string, path: string, handler: Handler): void {
@@ -480,6 +494,88 @@ export class ControlPlane {
     const limit = Math.min(Number(query.get("limit") ?? 1000), 5000)
     const events = await this.business.audit.list({ tenantId: principal.tenantId, orgId: orgId!, projectId: projectId! }, limit)
     this.json(res, 200, { events })
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 1F: operational health + reconciliation (tenant-scoped)
+  //
+  // Tenant-facing endpoints derive the tenant EXCLUSIVELY from the authenticated
+  // principal (`principal.tenantId`), never from the request body — so an
+  // ordinary tenant credential can never read another tenant's operational data
+  // (cross-tenant access returns 404, no leak). System/operator-level
+  // inspection additionally requires an explicitly privileged (admin) principal.
+  // -------------------------------------------------------------------------
+
+  /** Lazily build the reconciliation service from the wired business stores. */
+  private reconciliationService(): ReconciliationService | null {
+    if (!this.business || !this.business.jobs || !this.business.reconciliationStore) return null
+    return new ReconciliationService({
+      runner: this.runner,
+      jobs: this.business.jobs,
+      metering: this.business.metering,
+      billing: this.business.billing,
+      quota: this.business.quota,
+      store: this.business.reconciliationStore,
+    })
+  }
+
+  /** POST /reconcile — run a tenant-scoped reconciliation pass. */
+  private async triggerReconcile(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, principal: AuthnPrincipal, query: URLSearchParams): Promise<void> {
+    const service = this.reconciliationService()
+    if (!service) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "reconciliation not enabled" } })
+    const result = await service.reconcile({
+      tenantId: principal.tenantId,
+      scope: query.get("scope") ?? "tenant",
+      maxJobs: query.get("maxJobs") ? Number(query.get("maxJobs")) : undefined,
+      repair: query.get("repair") === "false" ? false : true,
+    })
+    this.json(res, 200, result)
+  }
+
+  /** GET /reconcile/health — reconciliation health for the authenticated tenant. */
+  private async reconcileHealth(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    const service = this.reconciliationService()
+    if (!service) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "reconciliation not enabled" } })
+    const health = await service.health(principal.tenantId)
+    this.json(res, 200, health)
+  }
+
+  /** GET /operations/health — operational health for the authenticated tenant.
+   *  Aggregates reconciliation health, unresolved usage/pricing, reservation
+   *  backlog, settlement backlog, and snapshot GC backlog. Tenant-scoped; an
+   *  ordinary tenant sees ONLY its own data. */
+  private async operationsHealth(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "business layer not enabled" } })
+    const tenantId = principal.tenantId
+    const recon = this.reconciliationService()
+    const reconHealth = recon ? await recon.health(tenantId) : null
+    const unresolvedUsage = this.business.billing.listSettlementsByState(tenantId, "unresolved").length
+    const pendingSettlement = this.business.billing.listSettlementsByState(tenantId, "pending").length
+    const expiredReservations = await this.business.quota.listExpiredActive()
+    const scopedExpired = expiredReservations.filter((r) => r.tenantId === tenantId).length
+    const snapshotGcBacklog = this.business.snapshotGc
+      ? this.business.snapshotGc.listByState("eligible").length + this.business.snapshotGc.listByState("deleting").length + this.business.snapshotGc.listByState("failed").length
+      : 0
+    this.json(res, 200, {
+      tenantId,
+      reconciliation: reconHealth,
+      unresolvedUsage,
+      unresolvedPricing: unresolvedUsage,
+      pendingSettlement,
+      settlementBacklog: unresolvedUsage + pendingSettlement,
+      expiredReservations: scopedExpired,
+      snapshotGcBacklog,
+    })
+  }
+
+  /** POST /operations/snapshot-gc — run one snapshot GC pass (operator). */
+  private async triggerSnapshotGc(_req: IncomingMessage, res: ServerResponse, _params: Record<string, string>, principal: AuthnPrincipal): Promise<void> {
+    if (!this.business?.snapshotGc) return this.json(res, 501, { error: { code: "NOT_CONFIGURED", message: "snapshot GC not enabled" } })
+    // Snapshot GC is an operator action: require an explicitly privileged
+    // principal. An ordinary tenant cannot trigger cross-scope deletion.
+    if (!principal.admin) return this.json(res, 403, { error: { code: "FORBIDDEN", message: "operator privileges required" } })
+    const result = await this.business.snapshotGc.runGc()
+    this.json(res, 200, result)
   }
 
   // -------------------------------------------------------------------------

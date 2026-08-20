@@ -98,6 +98,25 @@ export const IDENTITY_MIGRATIONS: readonly Migration[] = [
       `CREATE INDEX api_keys_org_idx ON api_keys (tenant_id, org_id)`,
     ],
   },
+  {
+    // Phase 1F: API key operational lifecycle. Adds expiry, scope restrictions,
+    // rotation linkage, and an overlap window. Expiry (`expires_at`) is checked
+    // at authentication (an expired key is rejected exactly like a revoked key).
+    // `scope` is a JSON array of allowed project ids (NULL = all projects the
+    // principal is granted within the org). `rotated_from` links a replacement
+    // key to the key it supersedes; `overlap_expires_at` bounds the controlled
+    // overlap period during rotation. Authorization always uses authoritative
+    // key state (revoked/expires/scope), never cached `last_used_at`.
+    version: 12,
+    name: "api_key_lifecycle",
+    statements: [
+      `ALTER TABLE api_keys ADD COLUMN expires_at INTEGER`,
+      `ALTER TABLE api_keys ADD COLUMN scope TEXT`,
+      `ALTER TABLE api_keys ADD COLUMN rotated_from TEXT`,
+      `ALTER TABLE api_keys ADD COLUMN overlap_expires_at INTEGER`,
+      `CREATE INDEX api_keys_rotated_from_idx ON api_keys (rotated_from)`,
+    ],
+  },
 ]
 
 interface TenantRow {
@@ -150,6 +169,29 @@ interface ApiKeyRow {
   created_at: number
   revoked_at: number | null
   last_used_at: number | null
+  expires_at: number | null
+  scope: string | null
+  rotated_from: string | null
+  overlap_expires_at: number | null
+}
+
+function toApiKeyRecord(row: ApiKeyRow): ApiKeyRecord {
+  return {
+    keyId: row.key_id,
+    tenantId: row.tenant_id,
+    orgId: row.org_id,
+    principalId: row.principal_id,
+    name: row.name,
+    keyPrefix: row.key_prefix,
+    secretHash: row.secret_hash,
+    createdAt: row.created_at,
+    revokedAt: row.revoked_at,
+    lastUsedAt: row.last_used_at,
+    expiresAt: row.expires_at,
+    scope: row.scope ? (JSON.parse(row.scope) as string[]) : null,
+    rotatedFrom: row.rotated_from,
+    overlapExpiresAt: row.overlap_expires_at,
+  }
 }
 
 function id(prefix: string): string {
@@ -346,7 +388,13 @@ export class SqlIdentityStore extends SqlStoreBase {
    * only a one-way verifier + lookup prefix are durable. The key id doubles as
    * the lookup identifier.
    */
-  async createApiKey(tenantId: string, orgId: string, principalId: string, name: string): Promise<CreatedApiKey> {
+  async createApiKey(
+    tenantId: string,
+    orgId: string,
+    principalId: string,
+    name: string,
+    options: { expiresAt?: number; scope?: readonly string[]; rotatedFrom?: string; overlapExpiresAt?: number } = {},
+  ): Promise<CreatedApiKey> {
     if (!(await this.getOrganization(tenantId, orgId))) throw new IdentityError("ORG_NOT_FOUND", `Organization ${orgId} not found in tenant ${tenantId}`)
     const keyId = id("vc_live")
     const body = randomBytes(24).toString("base64url")
@@ -356,12 +404,35 @@ export class SqlIdentityStore extends SqlStoreBase {
     const secret = `${keyId}.${body}`
     const keyPrefix = `${keyId.slice(0, 12)}…`
     const now = Date.now()
+    const scopeJson = options.scope ? JSON.stringify([...options.scope]) : null
     this.atomic("createApiKey", () => {
       this.prepare(
-        "INSERT INTO api_keys (key_id, tenant_id, org_id, principal_id, name, key_prefix, secret_hash, created_at, revoked_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-      ).run(keyId, tenantId, orgId, principalId, name, keyPrefix, hashSecret(secret), now)
+        "INSERT INTO api_keys (key_id, tenant_id, org_id, principal_id, name, key_prefix, secret_hash, created_at, revoked_at, last_used_at, expires_at, scope, rotated_from, overlap_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
+      ).run(keyId, tenantId, orgId, principalId, name, keyPrefix, hashSecret(secret), now, options.expiresAt ?? null, scopeJson, options.rotatedFrom ?? null, options.overlapExpiresAt ?? null)
     })
-    return { keyId, tenantId, orgId, principalId, name, keyPrefix, secretHash: hashSecret(secret), createdAt: now, revokedAt: null, lastUsedAt: null, secret }
+    return {
+      keyId,
+      tenantId,
+      orgId,
+      principalId,
+      name,
+      keyPrefix,
+      secretHash: hashSecret(secret),
+      createdAt: now,
+      revokedAt: null,
+      lastUsedAt: null,
+      expiresAt: options.expiresAt ?? null,
+      scope: options.scope ? [...options.scope] : null,
+      rotatedFrom: options.rotatedFrom ?? null,
+      overlapExpiresAt: options.overlapExpiresAt ?? null,
+      secret,
+    }
+  }
+
+  /** Read a single API key record (tenant-scoped). */
+  async getApiKey(tenantId: string, keyId: string): Promise<ApiKeyRecord | null> {
+    const row = this.prepare("SELECT * FROM api_keys WHERE key_id = ? AND tenant_id = ?").get(keyId, tenantId) as unknown as ApiKeyRow | undefined
+    return row ? toApiKeyRecord(row) : null
   }
 
   async revokeApiKey(tenantId: string, keyId: string): Promise<void> {
@@ -376,26 +447,94 @@ export class SqlIdentityStore extends SqlStoreBase {
     }
   }
 
+  /**
+   * Phase 1F: set an absolute expiry on a key (without revoking it immediately).
+   * The key authenticates until `expiresAt`, then is rejected. Useful for
+   * scheduled rotation without an explicit revoke call.
+   */
+  async expireApiKey(tenantId: string, keyId: string, expiresAt: number): Promise<void> {
+    const result = this.atomic("expireApiKey", () =>
+      this.prepare("UPDATE api_keys SET expires_at = ? WHERE key_id = ? AND tenant_id = ?").run(expiresAt, keyId, tenantId),
+    )
+    if (result.changes === 0) {
+      const row = this.prepare("SELECT key_id FROM api_keys WHERE key_id = ? AND tenant_id = ?").get(keyId, tenantId) as { key_id: string } | undefined
+      if (!row) throw new IdentityError("APIKEY_NOT_FOUND", `API key ${keyId} not found`)
+    }
+  }
+
+  /**
+   * Phase 1F: rotate an API key with a controlled overlap window.
+   *
+   *   old key valid → create replacement → controlled overlap → old expires/revokes
+   *
+   * Creates a replacement key linked (`rotated_from`) to the old key, and sets
+   * the old key's `overlap_expires_at` to `now + overlapMs`. Until that time
+   * BOTH keys authenticate (overlap); after it, {@link reapExpiredKeys} (or an
+   * explicit {@link revokeApiKey}) retires the old key. The plaintext secret of
+   * the replacement is returned exactly once; the old key's secret is never
+   * re-exposed. The replacement inherits the old key's scope/expiry policy
+   * unless overridden.
+   *
+   * Returns the replacement (with secret) and the updated old-key record.
+   */
+  async rotateApiKey(
+    tenantId: string,
+    oldKeyId: string,
+    options: { overlapMs: number; name?: string; expiresAt?: number; scope?: readonly string[] },
+  ): Promise<{ replacement: CreatedApiKey; oldKey: ApiKeyRecord }> {
+    const old = await this.getApiKey(tenantId, oldKeyId)
+    if (!old) throw new IdentityError("APIKEY_NOT_FOUND", `API key ${oldKeyId} not found`)
+    if (old.revokedAt !== null) throw new IdentityError("APIKEY_REVOKED", `API key ${oldKeyId} is already revoked`)
+    const now = Date.now()
+    const overlapExpiresAt = now + options.overlapMs
+    // Mark the old key's overlap window.
+    this.atomic("rotateApiKey_setOverlap", () => {
+      this.prepare("UPDATE api_keys SET overlap_expires_at = ? WHERE key_id = ? AND tenant_id = ?").run(overlapExpiresAt, oldKeyId, tenantId)
+    })
+    // Create the replacement, inheriting scope unless overridden.
+    const replacement = await this.createApiKey(tenantId, old.orgId, old.principalId, options.name ?? `${old.name} (rotated)`, {
+      expiresAt: options.expiresAt ?? old.expiresAt ?? undefined,
+      scope: options.scope ?? old.scope ?? undefined,
+      rotatedFrom: oldKeyId,
+    })
+    const updatedOld = await this.getApiKey(tenantId, oldKeyId)
+    return { replacement, oldKey: updatedOld! }
+  }
+
+  /**
+   * Phase 1F: reap keys whose overlap window has elapsed (auto-retire the old
+   * key in a rotation) and keys whose absolute expiry has passed. Revokes them
+   * (sets `revoked_at`) so they can no longer authenticate. Idempotent: a
+   * already-revoked key is skipped. Returns the count of newly-revoked keys.
+   */
+  async reapExpiredKeys(now: number = Date.now()): Promise<number> {
+    return this.atomic("reapExpiredKeys", (): number => {
+      const expired = this.prepare(
+        "SELECT key_id FROM api_keys WHERE revoked_at IS NULL AND ((overlap_expires_at IS NOT NULL AND overlap_expires_at <= ?) OR (expires_at IS NOT NULL AND expires_at <= ?))",
+      ).all(now, now) as Array<{ key_id: string }>
+      for (const row of expired) {
+        this.prepare("UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND revoked_at IS NULL").run(now, row.key_id)
+      }
+      return expired.length
+    })
+  }
+
   async listApiKeys(tenantId: string, orgId: string): Promise<ApiKeyRecord[]> {
     const rows = this.prepare("SELECT * FROM api_keys WHERE tenant_id = ? AND org_id = ? ORDER BY created_at ASC").all(tenantId, orgId) as unknown as ApiKeyRow[]
-    return rows.map((row) => ({
-      keyId: row.key_id,
-      tenantId: row.tenant_id,
-      orgId: row.org_id,
-      principalId: row.principal_id,
-      name: row.name,
-      keyPrefix: row.key_prefix,
-      secretHash: row.secret_hash,
-      createdAt: row.created_at,
-      revokedAt: row.revoked_at,
-      lastUsedAt: row.last_used_at,
-    }))
+    return rows.map(toApiKeyRecord)
   }
 
   /**
    * Verify an API key secret and resolve the principal it belongs to. A
-   * revoked or unknown key rejects. Updates `last_used_at` only on success.
-   * Never returns the stored secret hash to the caller.
+   * revoked, expired, or unknown key rejects. Authorization uses the
+   * authoritative key state (revoked/expires/scope), never cached
+   * `last_used_at`. `last_used_at` is updated best-effort only on successful
+   * authentication; it is metadata for ops, never an authz input, so its
+   * async/lazy nature cannot become a bottleneck or race source.
+   *
+   * Phase 1F: enforces absolute expiry (`expires_at`) at authentication time —
+   * an expired key is rejected exactly like a revoked key. Project scope
+   * restrictions (`scope`) are enforced at {@link authorize} time.
    */
   async authenticateApiKey(secret: string): Promise<ResolvedPrincipal | null> {
     const parsed = parseSecret(secret)
@@ -403,13 +542,17 @@ export class SqlIdentityStore extends SqlStoreBase {
     const row = this.prepare("SELECT * FROM api_keys WHERE key_id = ?").get(parsed.keyId) as unknown as ApiKeyRow | undefined
     if (!row) return null
     if (row.revoked_at !== null) return null
+    // Expiry: an expired key is rejected like a revoked key.
+    if (row.expires_at !== null && row.expires_at <= Date.now()) return null
     if (!verifySecret(secret, row.secret_hash)) return null
     const member = await this.getMember(row.tenant_id, row.org_id, row.principal_id)
     if (!member) return null
     this.atomic("touchApiKey", () =>
       this.prepare("UPDATE api_keys SET last_used_at = ? WHERE key_id = ?").run(Date.now(), row.key_id),
     )
-    return await this.resolvePrincipal(row.principal_id, row.org_id, member.role)
+    const principal = await this.resolvePrincipal(row.principal_id, row.org_id, member.role)
+    // Attach the key's project scope restriction so authorize can enforce it.
+    return { ...principal, apiKeyScope: row.scope ? (JSON.parse(row.scope) as string[]) : null, apiKeyId: row.key_id }
   }
 
   // -------------------------------------------------------------------------
@@ -455,6 +598,15 @@ export class SqlIdentityStore extends SqlStoreBase {
       }
       const allowed = principal.projectScope.includes("*") || principal.projectScope.includes(scope.projectId)
       if (!allowed) throw new IdentityError("FORBIDDEN_PROJECT", `Principal not granted access to project ${scope.projectId}`)
+    }
+    // Phase 1F: enforce the authenticating API key's project scope restriction
+    // (in addition to the principal's grants). A key scoped to a subset of
+    // projects cannot act on projects outside that subset, even if the principal
+    // is granted them. null/undefined = unrestricted (within grants).
+    if (principal.apiKeyScope && scope.projectId !== "*") {
+      if (!principal.apiKeyScope.includes(scope.projectId)) {
+        throw new IdentityError("FORBIDDEN_APIKEY_SCOPE", `API key not scoped for project ${scope.projectId}`)
+      }
     }
     return scope
   }

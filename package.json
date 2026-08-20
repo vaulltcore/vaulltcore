@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "vitest run",
+    "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run",
     "typecheck": "tsc --build packages/*"
   },
   "devDependencies": {

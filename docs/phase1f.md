@@ -6,8 +6,11 @@ and partial metering/billing pipelines. The execution kernel (Phases 1A–1E) is
 phase: no business logic was placed into `AgentRunner` internals or OpenCode-derived engine code.
 Phase 1F improves operational durability and economic correctness **around** the kernel.
 
-**Status:** COMPLETE. Tests: 158 passed, 17 skipped (all skips are environment-gated PostgreSQL
-server / Docker, reported honestly as skips — never as passes). Typecheck green.
+**Status:** COMPLETE. With the gated services provisioned (PostgreSQL server on
+`/tmp/pgsock:5434` + Docker daemon), the full suite runs **green: 175 passed, 0 skipped, 0 errors,
+0 warnings** (the Node `node:sqlite` `ExperimentalWarning` is suppressed via the `test` script's
+`NODE_OPTIONS=--disable-warning=ExperimentalWarning`). Typecheck green. When the services are
+absent the gated suites fall back to **honest skips, never false passes**.
 
 ---
 
@@ -455,34 +458,33 @@ identical to a server. The PGlite tier proves the SQL-level fencing — UNIQUE c
 UPDATEs, `ON CONFLICT DO NOTHING`, version fencing — that make the economic invariants hold. This is
 **genuine PostgreSQL validation**, not a SQLite stand-in.
 
-`packages/vaulltcore-control/test/postgres-conformance-1f.test.ts` — Tier A: **9 passed, 2 skipped**.
-Covers: duplicate usage (one event), concurrent settlement (one ledger), fenced mutation rejection,
-reconciliation restart (no duplicate projections), transaction rollback (no partial boundary),
-distributed idempotency (one slot), quota oversubscription rejection, reservation expiry/reaper
-(capacity released once).
+`packages/vaulltcore-control/test/postgres-conformance-1f.test.ts` — Tier A: **9 passed** (always runs). Covers: duplicate usage (one event), concurrent settlement (one ledger), fenced mutation rejection, reconciliation restart (no duplicate projections), transaction rollback (no partial boundary), distributed idempotency (one slot), quota oversubscription rejection, reservation expiry/reaper (capacity released once).
 
 ### Tier B — Multi-connection PostgreSQL server (gated, SKIPPED when unavailable)
 
 Proves two **independent connections** racing on the same key serialize to exactly one authoritative
 operation under SERIALIZABLE + row-level locks. Gated on `PG_TEST_HOST`/`PG_TEST_PORT`/`PG_TEST_USER`/
 `PG_TEST_DB` (defaults: `/tmp/pgsock:5434`, user `postgres`, db `vaulltcore_test`). **Skipped
-honestly** (never faked) when no server is configured. Currently **2 skipped**.
+honestly** (never faked) when no server is configured. With a server provisioned at the defaults, Tier B runs and passes (**2 passed**).
 
-The existing `postgres-conformance.test.ts` (Phase 1D) remains gated identically (8 skipped when PG
-unavailable).
+The existing `postgres-conformance.test.ts` (Phase 1D) is gated identically (**8 passed** when PG is
+available at the defaults; skipped otherwise).
 
 ### Honest reporting
 
 Per the non-negotiable guarantees: PostgreSQL skips are reported as **skips, never as passes**. The
-availability-report test asserts `pgServerAvailable === false` when no server is present.
+availability-report test asserts `pgServerAvailable === false` when no server is present (and `=== true` when one is).
 
 ---
 
 ## 13. Known Limitations
 
-1. **Multi-connection server tier not executed in sandbox:** the sandbox has no PostgreSQL server, so
-   Tier B is skipped. Tier A (PGlite) provides real PostgreSQL-engine validation of the SQL
-   invariants. To run Tier B: start PostgreSQL, create `vaulltcore_test`, set `PG_TEST_*` env vars.
+1. **Multi-connection server tier is environment-gated:** Tier B requires a live PostgreSQL server
+   (defaults: `/tmp/pgsock:5434`, user `postgres`, db `vaulltcore_test`) and the Docker suite
+   requires a reachable Docker daemon. When present they run and pass (verified: 175/175 green);
+   when absent they skip honestly. Provision: `initdb` a cluster, start `postgres` with
+   `-c unix_socket_directories=/tmp/pgsock -c port=5434`, `createdb vaulltcore_test`; start
+   `dockerd` and ensure the runner can reach the socket (group `docker` or `DOCKER_CMD`).
 2. **Bounded overshoot in runtime enforcement:** token/duration budgets are checked at step
    boundaries, so a single turn may exceed the budget by up to one turn's usage. This is documented,
    not hidden; checkpoint correctness is never sacrificed.
@@ -514,13 +516,16 @@ availability-report test asserts `pgServerAvailable === false` when no server is
 
 ## 15. Test Totals
 
-**Full suite: 158 passed, 17 skipped (175 total).** All skips are environment-gated (PostgreSQL
-server, Docker) and reported honestly.
+**Full suite: 175 passed, 0 skipped (with PG + Docker provisioned).** Without those services the
+17 environment-gated tests (PostgreSQL server, Docker) skip honestly. The Node `node:sqlite`
+`ExperimentalWarning` is suppressed via the `test` script's
+`NODE_OPTIONS=--disable-warning=ExperimentalWarning`.
 
 | Suite | Tests |
 |---|---|
+| `vaulltcore-control/test/business-layer.test.ts` | 22 passed |
 | `vaulltcore-control/test/phase1f.test.ts` | 24 passed |
-| `vaulltcore-control/test/postgres-conformance-1f.test.ts` | 9 passed, 2 skipped |
+| `vaulltcore-control/test/postgres-conformance-1f.test.ts` | 11 passed (9 PGlite + 2 PG server) |
 | `vaulltcore-control/test/control-plane.test.ts` | 10 passed |
 | `vaulltcore-control/test/deployment-boundary.test.ts` | 3 passed |
 | `vaulltcore-runner/test/durable-runner.test.ts` | 16 passed |
@@ -529,10 +534,10 @@ server, Docker) and reported honestly.
 | `vaulltcore-store-sql/test/sql-store.test.ts` | 14 passed |
 | `vaulltcore-store-sql/test/idempotency-snapshot.test.ts` | 11 passed |
 | `vaulltcore-store-sql/test/pglite-smoke.test.ts` | 2 passed |
-| `vaulltcore-store-sql/test/postgres-conformance.test.ts` | 8 skipped (PG gated) |
+| `vaulltcore-store-sql/test/postgres-conformance.test.ts` | 8 passed (PG gated) |
 | `vaulltcore-worker/test/distributed-ownership.test.ts` | 11 passed |
 | `vaulltcore-environment-cloud/test/cloud-environment.test.ts` | 9 passed |
-| `vaulltcore-environment-docker/test/docker-provider.test.ts` | 7 skipped (Docker gated) |
+| `vaulltcore-environment-docker/test/docker-provider.test.ts` | 7 passed (Docker gated) |
 | `vaulltcore-runner-opencode/test/opencode-adapter.test.ts` | 3 passed |
 
 All Phase 1A–1E regression tests remain green; no existing tests were weakened.

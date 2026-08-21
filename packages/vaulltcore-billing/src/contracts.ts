@@ -52,6 +52,13 @@ export interface LedgerEntry {
   /** Idempotency key: UNIQUE (scope, source_ref) prevents duplicate charges. */
   readonly idempotencyKey: string
   readonly createdAt: number
+  /** Phase 2F: for adjustments, the original entry being corrected (null for
+   *  charges). The original entry is NEVER mutated by an adjustment. */
+  readonly originalEntryId: string | null
+  /** Phase 2F: typed adjustment reason (null for charges). */
+  readonly reason: AdjustmentReason | null
+  /** Phase 2F: sanitized human-readable note (never secrets). */
+  readonly note: string | null
 }
 
 export class BillingError extends Error {
@@ -84,6 +91,39 @@ export interface AccountBalance {
   readonly balance: number
   readonly charges: number
   readonly credits: number
+}
+
+/** A typed reason for an adjustment/credit (Phase 2F). Adjustments are
+ *  append-only corrections that reference an original accounting identity and
+ *  NEVER mutate the original quantity. */
+export const ADJUSTMENT_REASONS = [
+  "billing_error",
+  "overcharge",
+  "refund",
+  "goodwill_credit",
+  "quantity_correction",
+  "operator_override",
+] as const
+export type AdjustmentReason = (typeof ADJUSTMENT_REASONS)[number]
+
+/** Input to record an append-only adjustment referencing an original entry
+ *  (Phase 2F). The adjustment gets its OWN unique accounting identity; it never
+ *  mutates the original. `originalEntryId` makes the correction traceable. */
+export interface AdjustmentInput {
+  readonly identity: BillingScope
+  readonly kind: UsageKind
+  readonly quantity: number
+  /** The original ledger entry being corrected. */
+  readonly originalEntryId: string
+  /** Typed reason for the correction (auditable). */
+  readonly reason: AdjustmentReason
+  /** Optional human-readable note (sanitized; never secrets). */
+  readonly note?: string
+  /** Idempotency key: UNIQUE (scope, idempotency_key) prevents duplicate
+   *  adjustments for the same correction. */
+  readonly idempotencyKey: string
+  /** Amount in micro-currency to credit (negative = credit/refund). */
+  readonly amountMicro: number
 }
 
 /**

@@ -46,7 +46,7 @@ function echoTool(): { tool: Tool; executions: () => number } {
 function makeRunner(provider: ScriptModelProvider, tools: Tool[]): DurableAgentRunner {
   const store = new FileJobStore(path.join(root, "store"))
   const registry = new ProviderRegistry([{ model: "script-model", provider }])
-  const engine = new OpenCodeEngine(registry)
+  const engine = new OpenCodeEngine(registry.resolver())
   const workspace = new LocalWorkspaceProvider(path.join(root, "workspaces"))
   return new DurableAgentRunner({ store, engines: [engine], tools, workspace })
 }

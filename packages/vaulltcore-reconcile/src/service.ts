@@ -37,11 +37,24 @@
 import type { AgentRunner, JobEvent, JobStatus } from "@vaulltcore/runner"
 import { TERMINAL_STATUSES } from "@vaulltcore/runner"
 import type { SqlMeteringStore } from "@vaulltcore/metering"
-import { eventsToUsage, type MeteringIdentity } from "@vaulltcore/metering"
+import { eventsToUsage, eventsToUsageAttributed, type MeteringIdentity, type UsageAttribution } from "@vaulltcore/metering"
 import type { SqlBillingStore, SettleUsageInput } from "@vaulltcore/billing"
 import type { SqlQuotaStore } from "@vaulltcore/quota"
 import type { SqlReconciliationStore } from "./store"
 import type { GapKind } from "./store"
+
+/**
+ * Phase 2F: optional provider/model attribution for usage rebuilt during
+ * reconciliation. When provided, the reconciler uses
+ * {@link eventsToUsageAttributed} so rebuilt UsageEvents carry public
+ * provider/model identifiers (from the job spec, never credentials). When
+ * absent, the legacy {@link eventsToUsage} adapter is used — existing behavior
+ * is unchanged. Either way the dedup keys are identical, so a job metered by
+ * either path collapses to the same single durable charge (no
+ * double-accounting). Returns null when attribution is unavailable (honest,
+ * never fabricated).
+ */
+export type AttributionProvider = (job: { jobId: string; tenantId: string; orgId: string; projectId: string }) => UsageAttribution | null
 
 /** Tenant-scoped job index (satisfied by {@link SqlJobStore.listJobsByTenant}). */
 export interface JobIndex {
@@ -64,6 +77,8 @@ export interface ReconciliationDeps {
   readonly billing: SqlBillingStore
   readonly quota: SqlQuotaStore
   readonly store: SqlReconciliationStore
+  /** Phase 2F: optional provider/model attribution for rebuilt usage. */
+  readonly attributionProvider?: AttributionProvider
 }
 
 export interface ReconciliationResult {
@@ -168,9 +183,14 @@ export class ReconciliationService {
     // does not match the job's authoritative identity. Detected per-row below.
 
     // A: rebuild missing UsageEvents from committed events. Safe because the
-    // metering UNIQUE constraint collapses duplicates.
+    // metering UNIQUE constraint collapses duplicates. Phase 2F: when an
+    // attribution provider is wired, rebuilt usage carries public
+    // provider/model identifiers (from the job spec, never credentials). The
+    // dedup keys are identical to the legacy adapter, so attribution is
+    // interoperable — no double-accounting.
     const identity: MeteringIdentity = { tenantId, orgId, projectId, jobId }
-    const usageInputs = eventsToUsage(identity, events)
+    const attribution = this.deps.attributionProvider ? this.deps.attributionProvider(job) : null
+    const usageInputs = attribution ? eventsToUsageAttributed(identity, events, attribution) : eventsToUsage(identity, events)
     const recordedEvents: string[] = []
     if (usageInputs.length > 0) {
       const results = await this.deps.metering.recordBatch(usageInputs)

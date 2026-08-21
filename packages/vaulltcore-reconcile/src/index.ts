@@ -7,4 +7,5 @@ export {
   type ReconciliationHealth,
   type JobIndex,
   type GapKind as ReconciliationGapKind,
+  type AttributionProvider,
 } from "./service"

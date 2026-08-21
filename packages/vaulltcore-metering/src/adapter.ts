@@ -15,10 +15,24 @@
 
 import type { JobEvent, JobIdentity, JobMetrics } from "@vaulltcore/runner"
 import type { UsageEventInput } from "./contracts"
+import { AccountingIdentity } from "./contracts"
 
 /** Identity augmented with the job id (the runner's JobIdentity has no jobId). */
 export interface MeteringIdentity extends JobIdentity {
   readonly jobId: string
+}
+
+/**
+ * Provider/model attribution context (Phase 2F). Public identifiers only —
+ * resolved from the job spec (engine/model), NEVER from credentials. When
+ * `null`, usage is recorded WITHOUT attribution (represented honestly as
+ * unavailable, never guessed/fabricated). A non-null value attaches the
+ * provider/model to every produced usage event so the ledger can answer which
+ * configured model produced consumption without storing secrets.
+ */
+export interface UsageAttribution {
+  readonly provider: string
+  readonly model: string
 }
 
 /**
@@ -52,7 +66,7 @@ export function eventsToUsage(identity: MeteringIdentity, events: readonly JobEv
           identity,
           kind: "model_request",
           quantity: 1,
-          dedupKey: `step:${event.seq}`,
+          dedupKey: AccountingIdentity.modelStep(identity.jobId, event.seq),
           unit: "request",
         })
         break
@@ -62,7 +76,7 @@ export function eventsToUsage(identity: MeteringIdentity, events: readonly JobEv
           identity,
           kind: "tool_call",
           quantity: 1,
-          dedupKey: `tool:${event.seq}`,
+          dedupKey: AccountingIdentity.tool(identity.jobId, event.seq),
           unit: "call",
         })
         break
@@ -74,12 +88,30 @@ export function eventsToUsage(identity: MeteringIdentity, events: readonly JobEv
   return out
 }
 
+/**
+ * Phase 2F: like {@link eventsToUsage} but attaches provider/model attribution
+ * to every produced usage event. The dedup keys are IDENTICAL to
+ * {@link eventsToUsage} (same identity boundary), so a job metered by either
+ * adapter collapses to the same single durable charge — no double-accounting
+ * when attribution is added later or when a legacy reconciliation pass runs.
+ * Attribution is public identifiers only (from the job spec), never secrets.
+ */
+export function eventsToUsageAttributed(
+  identity: MeteringIdentity,
+  events: readonly JobEvent[],
+  attribution: UsageAttribution | null,
+): UsageEventInput[] {
+  const base = eventsToUsage(identity, events)
+  if (!attribution) return base
+  return base.map((e) => ({ ...e, provider: attribution.provider, model: attribution.model }))
+}
+
 function tokenEvent(identity: MeteringIdentity, seq: number, bucket: string, quantity: number): UsageEventInput {
   return {
     identity,
     kind: "model_tokens",
     quantity,
-    dedupKey: `tokens:${seq}:${bucket}`,
+    dedupKey: AccountingIdentity.tokens(identity.jobId, seq, bucket),
     unit: "tokens",
   }
 }
@@ -94,7 +126,7 @@ export function durationUsage(identity: MeteringIdentity, durationMs: number): U
     identity,
     kind: "execution_duration",
     quantity: durationMs,
-    dedupKey: `duration:${identity.jobId}`,
+    dedupKey: AccountingIdentity.duration(identity.jobId),
     unit: "ms",
   }
 }
@@ -105,7 +137,7 @@ export function snapshotUsage(identity: MeteringIdentity, snapshotId: string, by
     identity,
     kind: "snapshot_storage",
     quantity: bytes,
-    dedupKey: `snapshot:${snapshotId}`,
+    dedupKey: AccountingIdentity.snapshot(identity.jobId, snapshotId),
     unit: "bytes",
   }
 }

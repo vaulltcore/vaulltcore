@@ -31,6 +31,7 @@ import type { SnapshotGcDriver } from "@vaulltcore/store-sql"
 import { AUTOMATION_ROUTES, type AutomationLayer, type AutomationRouteContext, buildAutomationLayer } from "./automation-routes"
 import { PHASE2B_ROUTES, type Phase2bRouteContext, type Phase2bLayerOptions } from "./phase2b-routes"
 import { PHASE2E_ROUTES, type Phase2eRouteContext, type Phase2eLayerOptions } from "./phase2e-routes"
+import { PHASE2F_ROUTES, type Phase2fRouteContext, type Phase2fLayerOptions, buildPhase2fContext } from "./phase2f-routes"
 import { AutomationError } from "@vaulltcore/automation"
 
 export interface ControlPlaneOptions {
@@ -56,6 +57,10 @@ export interface ControlPlaneOptions {
    *  (for cancel/reconcile) + ops store. Additive; when absent the legacy
    *  behavior is preserved. */
   readonly phase2e?: Phase2eLayerOptions
+  /** Phase 2F: durable metering + immutable usage ledger + cost attribution +
+   *  B2B usage governance (/usage/* routes). Additive; when absent the
+   *  behavior is preserved. */
+  readonly phase2f?: Phase2fLayerOptions
 }
 
 /** Business-layer wiring. All stores share one SQL database. */
@@ -122,6 +127,7 @@ export class ControlPlane {
   private readonly automationContext: AutomationRouteContext | null
   private readonly phase2bContext: Phase2bRouteContext | null
   private readonly phase2eContext: Phase2eRouteContext | null
+  private readonly phase2fContext: Phase2fRouteContext | null
 
   constructor(options: ControlPlaneOptions) {
     this.runner = options.runner
@@ -188,6 +194,17 @@ export class ControlPlane {
           json: (res, status, body) => this.json(res, status, body),
           readBody: (req) => this.readBody(req),
         }
+      : null
+    // Phase 2F: durable metering + immutable usage ledger + cost attribution +
+    // B2B usage governance (/usage/* routes). Additive; when the layer is
+    // absent these routes are not registered and the legacy behavior is
+    // preserved.
+    this.phase2fContext = options.phase2f
+      ? buildPhase2fContext(options.phase2f, {
+          resolvePrincipal: (req, authn) => this.resolvePrincipal(req, authn as AuthnPrincipal),
+          json: (res, status, body) => this.json(res, status, body),
+          readBody: (req) => this.readBody(req),
+        })
       : null
     this.add("POST", "/jobs", this.createJob)
     this.add("GET", "/jobs/:jobId", this.getJob)
@@ -296,6 +313,20 @@ export class ControlPlane {
           pe.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
           const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
           await pe.handler(req, res, params, authn, url.searchParams, this.phase2eContext)
+          return
+        }
+      }
+      // Phase 2F usage governance routes (/usage/*). Matched before the generic
+      // routes so the specific patterns win. Additive; when the phase2f layer
+      // is absent this block is skipped entirely.
+      if (this.phase2fContext && url.pathname.startsWith("/usage")) {
+        const pf = PHASE2F_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
+        if (pf) {
+          const values = pf.pattern.exec(url.pathname)
+          const params: Record<string, string> = {}
+          pf.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
+          const authn = { tenantId: principal.tenantId, orgId: principal.orgId, projectId: principal.projectId, admin: principal.admin }
+          await pf.handler(req, res, params, authn, url.searchParams, this.phase2fContext)
           return
         }
       }

@@ -24,6 +24,7 @@ import {
   type SettleUsageResult,
   type UsageSettlement,
   type SettlementState,
+  type AdjustmentInput,
   BillingError,
 } from "./contracts"
 
@@ -58,6 +59,22 @@ export const BILLING_MIGRATIONS: readonly Migration[] = [
       )`,
       `CREATE INDEX ledger_scope_idx ON ledger_entries (tenant_id, org_id, project_id)`,
       `CREATE INDEX ledger_job_idx ON ledger_entries (tenant_id, job_id)`,
+    ],
+  },
+  // Phase 2F: append-only adjustments that reference an original accounting
+  // identity. Nullable columns (existing rows get NULL); additive — no
+  // destructive change. An adjustment is a NEW ledger entry (type='adjustment')
+  // with original_entry_id + reason + note; the original entry is NEVER
+  // mutated. UNIQUE (tenant_id, org_id, project_id, idempotency_key) already
+  // prevents a duplicate adjustment for the same correction.
+  {
+    version: 12,
+    name: "billing_adjustments",
+    statements: [
+      `ALTER TABLE ledger_entries ADD COLUMN original_entry_id TEXT`,
+      `ALTER TABLE ledger_entries ADD COLUMN reason TEXT`,
+      `ALTER TABLE ledger_entries ADD COLUMN note TEXT`,
+      `CREATE INDEX IF NOT EXISTS ledger_original_idx ON ledger_entries (tenant_id, original_entry_id)`,
     ],
   },
   {
@@ -120,6 +137,9 @@ interface LedgerRow {
   source_ref: string
   idempotency_key: string
   created_at: number
+  original_entry_id: string | null
+  reason: string | null
+  note: string | null
 }
 
 function toPricing(row: PricingRow): PricingVersion {
@@ -146,6 +166,9 @@ function toEntry(row: LedgerRow): LedgerEntry {
     sourceRef: row.source_ref,
     idempotencyKey: row.idempotency_key,
     createdAt: row.created_at,
+    originalEntryId: row.original_entry_id ?? null,
+    reason: (row.reason ?? null) as LedgerEntry["reason"],
+    note: row.note ?? null,
   }
 }
 
@@ -155,9 +178,16 @@ export const DEFAULT_PRICING: PricingVersion = {
   version: "1",
   unitPrices: {
     model_tokens: 2, // 2 micro per token
+    model_input_tokens: 2,
+    model_output_tokens: 8,
+    model_reasoning_tokens: 4,
     model_request: 500, // 0.5 cent per request
+    provider_api_request: 100,
     tool_call: 100,
+    tool_invocation: 100,
+    shell_execution: 50,
     execution_duration: 1, // 1 micro per ms
+    runtime_duration: 1,
     environment_allocation: 50,
     snapshot_storage: 1, // 1 micro per byte-ms (flat here)
   },
@@ -273,6 +303,88 @@ export class SqlBillingStore extends SqlStoreBase {
         input.sourceRef,
         input.idempotencyKey,
         now,
+      )
+      if (result.changes === 0) {
+        const existing = this.prepare(
+          "SELECT * FROM ledger_entries WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND idempotency_key = ?",
+        ).get(input.identity.tenantId, input.identity.orgId, input.identity.projectId, input.idempotencyKey) as unknown as LedgerRow
+        return { entry: toEntry(existing), duplicated: true }
+      }
+      const row = this.prepare("SELECT * FROM ledger_entries WHERE entry_id = ?").get(entryId) as unknown as LedgerRow
+      return { entry: toEntry(row), duplicated: false }
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 2F: append-only adjustments referencing an original accounting
+  // identity. An adjustment is a NEW ledger entry (its own unique idempotency
+  // key) that points back at the original via `original_entry_id` + a typed
+  // `reason`. The original entry is NEVER mutated: there is no UPDATE path on
+  // `amount`; corrections are always new rows. UNIQUE (tenant, org, project,
+  // idempotency_key) prevents a duplicate adjustment for the same correction.
+  // -------------------------------------------------------------------------
+
+  /** Read a single ledger entry (tenant-scoped; cross-tenant returns null). */
+  getEntry(tenantId: string, entryId: string): LedgerEntry | null {
+    const row = this.prepare("SELECT * FROM ledger_entries WHERE tenant_id = ? AND entry_id = ?").get(tenantId, entryId) as unknown as LedgerRow | undefined
+    return row ? toEntry(row) : null
+  }
+
+  /** All adjustments referencing an original entry (tenant-scoped). Proves an
+   *  adjustment appends rather than mutates: the original stays intact and each
+   *  correction is a distinct row. */
+  listAdjustmentsFor(tenantId: string, originalEntryId: string): LedgerEntry[] {
+    const rows = this.prepare("SELECT * FROM ledger_entries WHERE tenant_id = ? AND original_entry_id = ? ORDER BY created_at ASC").all(tenantId, originalEntryId) as unknown as LedgerRow[]
+    return rows.map(toEntry)
+  }
+
+  /**
+   * Record an append-only adjustment referencing an original entry. The
+   * adjustment has its own accounting identity (idempotency_key) and NEVER
+   * mutates the original. Requires a valid (existing) original entry in the
+   * same tenant scope — a cross-tenant original is rejected (no existence
+   * leak). Idempotent: a duplicate idempotency_key returns the existing
+   * adjustment. `amountMicro` is stored verbatim (callers pass a signed
+   * micro-currency value; negative = credit).
+   */
+  async recordAdjustment(
+    input: AdjustmentInput,
+    pricing: PricingVersion,
+  ): Promise<{ entry: LedgerEntry; duplicated: boolean }> {
+    if (!input.originalEntryId) throw new BillingError("INVALID_ADJUSTMENT", "originalEntryId is required")
+    if (!input.reason) throw new BillingError("INVALID_ADJUSTMENT", "reason is required")
+    const now = Date.now()
+    return this.atomic("recordAdjustment", () => {
+      // The original entry must exist in the SAME tenant scope. A cross-tenant
+      // original reference is rejected (no existence leak across tenants).
+      const original = this.prepare("SELECT entry_id FROM ledger_entries WHERE tenant_id = ? AND org_id = ? AND project_id = ? AND entry_id = ?").get(
+        input.identity.tenantId,
+        input.identity.orgId,
+        input.identity.projectId,
+        input.originalEntryId,
+      ) as { entry_id: string } | undefined
+      if (!original) throw new BillingError("ORIGINAL_NOT_FOUND", "original ledger entry not found in scope")
+      const entryId = `led_${randomBytes(12).toString("base64url")}`
+      const note = input.note ? input.note.slice(0, 500) : null
+      const result = this.prepare(
+        `INSERT INTO ledger_entries (entry_id, tenant_id, org_id, project_id, job_id, type, amount, pricing_id, pricing_version, source_ref, idempotency_key, created_at, original_entry_id, reason, note)
+         VALUES (?, ?, ?, ?, ?, 'adjustment', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tenant_id, org_id, project_id, idempotency_key) DO NOTHING`,
+      ).run(
+        entryId,
+        input.identity.tenantId,
+        input.identity.orgId,
+        input.identity.projectId,
+        input.identity.jobId,
+        input.amountMicro,
+        pricing.pricingId,
+        pricing.version,
+        `adjustment:${input.originalEntryId}`,
+        input.idempotencyKey,
+        now,
+        input.originalEntryId,
+        input.reason,
+        note,
       )
       if (result.changes === 0) {
         const existing = this.prepare(

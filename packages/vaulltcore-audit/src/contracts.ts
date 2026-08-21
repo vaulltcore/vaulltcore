@@ -102,6 +102,17 @@ export const AUDIT_EVENT_TYPES = [
   "work_cancelled",
   "work_timed_out",
   "work_terminal",
+  // Phase 2F: durable metering, immutable usage ledger, cost attribution &
+  // B2B usage governance. Additive (TEXT-persisted type). Significant
+  // administrative usage-accounting actions emit durable, sanitized records;
+  // high-volume token events belong in the usage ledger, NOT the audit log
+  // (audit is not a replacement for the usage ledger).
+  "usage_reconciliation_requested",
+  "usage_reconciliation_completed",
+  "usage_drift_detected",
+  "usage_adjustment_committed",
+  "usage_limit_changed",
+  "usage_export_requested",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

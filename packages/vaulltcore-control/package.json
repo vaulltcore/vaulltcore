@@ -26,7 +26,8 @@
     "@vaulltcore/connectors": "*",
     "@vaulltcore/models": "*",
     "@vaulltcore/webhooks": "*",
-    "@vaulltcore/reliability": "*"
+    "@vaulltcore/reliability": "*",
+    "@vaulltcore/usage-governance": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

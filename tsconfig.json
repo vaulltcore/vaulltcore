@@ -25,6 +25,7 @@
     { "path": "packages/vaulltcore-connectors" },
     { "path": "packages/vaulltcore-models" },
     { "path": "packages/vaulltcore-webhooks" },
-    { "path": "packages/vaulltcore-reliability" }
+    { "path": "packages/vaulltcore-reliability" },
+    { "path": "packages/vaulltcore-usage-governance" }
   ]
 }

@@ -28,7 +28,8 @@
     "@vaulltcore/webhooks": "*",
     "@vaulltcore/reliability": "*",
     "@vaulltcore/usage-governance": "*",
-    "@vaulltcore/auth": "*"
+    "@vaulltcore/auth": "*",
+    "@vaulltcore/runner-opencode": "*"
   },
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit"

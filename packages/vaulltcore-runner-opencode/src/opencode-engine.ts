@@ -23,7 +23,7 @@ import type {
 } from "@vaulltcore/runner"
 import { projectHistoryFromEvents } from "@vaulltcore/runner"
 import type { ModelProvider } from "./kernel/llm"
-import type { ProviderRegistry } from "./model-provider"
+import type { SessionProviderResolver } from "./model-provider"
 import { normalizeTurnEvent, toolWireDefinition } from "./kernel/normalize"
 
 const ENGINE_ID = "opencode"
@@ -40,10 +40,16 @@ export class OpenCodeEngine implements AgentEngine {
   readonly id = ENGINE_ID
   readonly version = ENGINE_VERSION
 
-  constructor(private readonly providers: ProviderRegistry) {}
+  /**
+   * @param resolveProvider Seam that yields the {@link ModelProvider} for a
+   * session. Tests supply `ProviderRegistry.resolver()` (deterministic);
+   * production supplies the models bridge resolver (`./models-bridge`). The
+   * engine never hard-codes a provider source.
+   */
+  constructor(private readonly resolveProvider: SessionProviderResolver) {}
 
   async createSession(init: EngineInit): Promise<EngineSession> {
-    const provider = this.providers.resolve(init.spec.model)
+    const provider = await this.resolveProvider(init)
     const handle: OpenCodeSessionHandle = {
       provider,
       model: init.spec.model,
@@ -54,7 +60,7 @@ export class OpenCodeEngine implements AgentEngine {
   }
 
   async restoreSession(init: EngineInit, history: readonly ChatMessage[]): Promise<EngineSession> {
-    const provider = this.providers.resolve(init.spec.model)
+    const provider = await this.resolveProvider(init)
     const handle: OpenCodeSessionHandle = {
       provider,
       model: init.spec.model,

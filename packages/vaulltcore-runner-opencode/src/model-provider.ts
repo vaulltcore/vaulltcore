@@ -1,19 +1,36 @@
 /**
  * ModelProvider registry + a deterministic scripted provider.
  *
- * The registry is the seam where real provider adapters (OpenAI-compatible,
- * Anthropic, ...) plug in. Phase 1A ships a deterministic provider that
- * replays fine-grained OpenCode LLM events, so the full durable pipeline —
- * including the fine→neutral event normalization — is exercised without
- * network calls.
+ * The registry is the deterministic/test path: `ScriptModelProvider` replays
+ * fine-grained OpenCode LLM events so the durable pipeline — including the
+ * fine→neutral event normalization — is exercised without network calls. It is
+ * NOT the production engine path. The production path resolves a credential-
+ * backed {@link ModelProviderAdapter} from `@vaulltcore/models` via the
+ * `modelsProviderResolver` bridge (`./models-bridge.ts`) and selects the
+ * {@link OpenCodeEngine} via `buildOpenCodeEngine` (`./compose.ts`).
+ *
+ * `SessionProviderResolver` is the seam between engine construction and
+ * provider source: tests use `ProviderRegistry.resolver()`, production uses
+ * `modelsProviderResolver`. The engine never hard-codes a provider source.
  */
 
+import type { EngineInit } from "@vaulltcore/runner"
 import type { LLMEvent, LLMRequest, ModelProvider } from "./kernel/llm"
 
 export interface ProviderEntry {
   readonly model: string
   readonly provider: ModelProvider
 }
+
+/**
+ * Resolves the {@link ModelProvider} for a job session from its
+ * {@link EngineInit}. May be async because the production resolver hits the
+ * credential-backed {@link ModelRegistry}. `ProviderRegistry.resolver()` and
+ * the models bridge in `./models-bridge` both produce this seam;
+ * `OpenCodeEngine` consumes it so the engine never hard-codes a provider
+ * source.
+ */
+export type SessionProviderResolver = (init: EngineInit) => ModelProvider | Promise<ModelProvider>
 
 export class ProviderRegistry {
   private readonly providers = new Map<string, ModelProvider>()
@@ -26,6 +43,11 @@ export class ProviderRegistry {
     const provider = this.providers.get(model)
     if (!provider) throw new Error(`No model provider registered for "${model}"`)
     return provider
+  }
+
+  /** Adapt this registry to the engine's session resolver (deterministic path). */
+  resolver(): SessionProviderResolver {
+    return (init) => this.resolve(init.spec.model)
   }
 }
 

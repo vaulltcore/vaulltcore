@@ -113,6 +113,22 @@ export const AUDIT_EVENT_TYPES = [
   "usage_adjustment_committed",
   "usage_limit_changed",
   "usage_export_requested",
+  // Phase 2G: B2B identity & tenant security hardening. Additive
+  // (TEXT-persisted type). Security-sensitive authentication/session/
+  // membership/service-identity actions emit durable, sanitized records;
+  // secrets are stripped by sanitizeMetadata before write. These names are
+  // exact — emitted by vaulltcore-auth / phase2g-routes.
+  "authentication_failed",
+  "session_revoked",
+  "user_identity_disabled",
+  "member_added",
+  "member_removed",
+  "member_role_changed",
+  "service_identity_created",
+  "service_identity_disabled",
+  "service_identity_revoked",
+  "machine_credential_issued",
+  "machine_credential_revoked",
 ] as const
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number]
 

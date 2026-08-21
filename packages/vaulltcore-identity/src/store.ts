@@ -324,6 +324,16 @@ export class SqlIdentityStore extends SqlStoreBase {
     return rows.map((row) => ({ tenantId: row.tenant_id, orgId: row.org_id, principalId: row.principal_id, role: row.role as Role, createdAt: row.created_at }))
   }
 
+  /**
+   * Phase 2G: all organization memberships of one principal. Human session
+   * resolution uses this to validate the explicit tenant context (client org
+   * hints are validated against the returned set — never trusted directly).
+   */
+  async listMembershipsByPrincipal(principalId: string): Promise<OrganizationMember[]> {
+    const rows = this.prepare("SELECT * FROM org_members WHERE principal_id = ? ORDER BY created_at ASC").all(principalId) as unknown as MemberRow[]
+    return rows.map((row) => ({ tenantId: row.tenant_id, orgId: row.org_id, principalId: row.principal_id, role: row.role as Role, createdAt: row.created_at }))
+  }
+
   async grantProject(tenantId: string, orgId: string, projectId: string, principalId: string, role: Role): Promise<ProjectGrant> {
     this.atomic("grantProject", () => {
       try {

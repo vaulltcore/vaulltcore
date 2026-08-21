@@ -18,6 +18,7 @@
     "vitest": "^2.1.0"
   },
   "dependencies": {
+    "better-auth": "^1.7.1",
     "pg": "^8.23.0"
   }
 }

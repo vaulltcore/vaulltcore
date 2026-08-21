@@ -32,7 +32,9 @@ import { AUTOMATION_ROUTES, type AutomationLayer, type AutomationRouteContext, b
 import { PHASE2B_ROUTES, type Phase2bRouteContext, type Phase2bLayerOptions } from "./phase2b-routes"
 import { PHASE2E_ROUTES, type Phase2eRouteContext, type Phase2eLayerOptions } from "./phase2e-routes"
 import { PHASE2F_ROUTES, type Phase2fRouteContext, type Phase2fLayerOptions, buildPhase2fContext } from "./phase2f-routes"
+import { PHASE2G_ROUTES, type Phase2gRouteContext, type Phase2gLayerOptions } from "./phase2g-routes"
 import { AutomationError } from "@vaulltcore/automation"
+import { AuthError, AuthorizationError } from "@vaulltcore/auth"
 
 export interface ControlPlaneOptions {
   readonly runner: AgentRunner
@@ -61,6 +63,10 @@ export interface ControlPlaneOptions {
    *  B2B usage governance (/usage/* routes). Additive; when absent the
    *  behavior is preserved. */
   readonly phase2f?: Phase2fLayerOptions
+  /** Phase 2G: B2B identity/authz hardening. Registers the public `/auth/*`
+   *  Better Auth bridge (when an adapter is provided) and the protected
+   *  `/identity/*` actor-resolved routes. Additive. */
+  readonly phase2g?: Phase2gLayerOptions
 }
 
 /** Business-layer wiring. All stores share one SQL database. */
@@ -128,6 +134,7 @@ export class ControlPlane {
   private readonly phase2bContext: Phase2bRouteContext | null
   private readonly phase2eContext: Phase2eRouteContext | null
   private readonly phase2fContext: Phase2fRouteContext | null
+  private readonly phase2gContext: Phase2gRouteContext | null
 
   constructor(options: ControlPlaneOptions) {
     this.runner = options.runner
@@ -206,6 +213,14 @@ export class ControlPlane {
           readBody: (req) => this.readBody(req),
         })
       : null
+    // Phase 2G: B2B identity/authz hardening. Additive; absent → no routes.
+    this.phase2gContext = options.phase2g
+      ? {
+          ...options.phase2g,
+          json: (res: ServerResponse, status: number, body: unknown) => this.json(res, status, body),
+          readBody: (req: IncomingMessage) => this.readBody(req),
+        }
+      : null
     this.add("POST", "/jobs", this.createJob)
     this.add("GET", "/jobs/:jobId", this.getJob)
     this.add("POST", "/jobs/:jobId/cancel", this.cancelJob)
@@ -255,7 +270,47 @@ export class ControlPlane {
       this.json(res, 200, { ok: true })
       return
     }
+    // Phase 2G public trust-boundary exception: `/auth/*` bridges to Better
+    // Auth (sign-up/sign-in/sign-out/OAuth). Explicitly public like /health —
+    // everything else below requires the authenticated pipeline.
+    if (this.phase2gContext?.betterAuth && url.pathname.startsWith("/auth/")) {
+      const body = req.method === "POST" || req.method === "PUT" || req.method === "PATCH" ? JSON.stringify(await this.readBody(req)) : undefined
+      const bridged = await this.phase2gContext.betterAuth.handleRequest({
+        method: req.method ?? "GET",
+        path: url.pathname.replace(/^\/auth\//, "/api/auth/") + url.search,
+        headers: req.headers as Record<string, string | string[] | undefined>,
+        ...(body !== undefined ? { body } : {}),
+      })
+      const headers = { ...bridged.headers }
+      res.writeHead(bridged.status, headers as Record<string, string | string[]>)
+      res.end(bridged.body)
+      return
+    }
     try {
+      // Phase 2G protected routes (/identity/*): resolved through the Phase 2G
+      // request security pipeline (authenticate → actor → tenant context →
+      // authorization), independent of the legacy header authenticator.
+      if (this.phase2gContext && url.pathname.startsWith("/identity/")) {
+        const actor = await this.phase2gContext.resolver.resolve({
+          authorization: req.headers.authorization,
+          cookie: req.headers.cookie,
+          requestedOrgId: typeof req.headers["x-vc-org"] === "string" ? req.headers["x-vc-org"] : undefined,
+        })
+        if (!actor) {
+          this.json(res, 401, { error: { code: "UNAUTHENTICATED", message: "authentication required" } })
+          return
+        }
+        const matched = PHASE2G_ROUTES.find((r) => r.method === req.method && r.pattern.test(url.pathname))
+        if (!matched) {
+          this.json(res, 404, { error: { code: "NOT_FOUND", message: "unknown identity route" } })
+          return
+        }
+        const values = matched.pattern.exec(url.pathname)
+        const params: Record<string, string> = {}
+        matched.keys.forEach((key, i) => { params[key] = values?.[i + 1] ?? "" })
+        await matched.handler(req, res, params, actor, url.searchParams, this.phase2gContext)
+        return
+      }
       const principal = await this.authenticator.authenticate(req)
       if (!principal) {
         this.json(res, 401, { error: { code: "UNAUTHENTICATED", message: "authentication required" } })
@@ -342,6 +397,25 @@ export class ControlPlane {
       })
       await route.handler(req, res, params, principal!, url.searchParams)
     } catch (error) {
+      // Phase 2G: deterministic, non-leaking security error surface.
+      if (error instanceof AuthorizationError) {
+        this.json(res, 403, { error: { code: "FORBIDDEN", message: error.message } })
+        return
+      }
+      if (error instanceof AuthError) {
+        const status =
+          error.code === "UNAUTHENTICATED" || error.code === "SESSION_EXPIRED" || error.code === "SESSION_REVOKED" || error.code === "USER_DISABLED" || error.code === "CREDENTIAL_REVOKED" || error.code === "CREDENTIAL_EXPIRED" || error.code === "SERVICE_IDENTITY_INACTIVE"
+            ? 401
+            : error.code === "ORG_NOT_MEMBER" || error.code === "NOT_FOUND"
+              ? 404
+              : error.code === "CONFLICT"
+                ? 409
+                : error.code === "INVALID_INPUT"
+                  ? 422
+                  : 401
+        this.json(res, status, { error: { code: error.code, message: error.message } })
+        return
+      }
       if (error instanceof AutomationError) {
         this.json(res, error.status, { error: { code: error.code, message: error.message } })
         return

@@ -7,7 +7,7 @@
 
 import { createServer } from "node:http"
 import { ControlPlane } from "./server.js"
-import { NodeSqliteDatabase, SqlJobStore, DistributedSqlStore, SqlDispatcher } from "@vaulltcore/store-sql"
+import { NodeSqliteDatabase, SqlJobStore, DistributedSqlStore, SqlDispatcher, SqlStoreBase } from "@vaulltcore/store-sql"
 import { WorkerHost, newWorkerIdentity } from "@vaulltcore/worker"
 import { buildOpenCodeRunner } from "./execution.js"
 import { SqlIdentityStore } from "@vaulltcore/identity"
@@ -16,13 +16,12 @@ import { SqlQuotaStore } from "@vaulltcore/quota"
 import { SqlMeteringStore } from "@vaulltcore/metering"
 import { SqlBillingStore } from "@vaulltcore/billing"
 import { SqlAuditStore } from "@vaulltcore/audit"
-import { SqlAutomationStore } from "@vaulltcore/automation"
+import { SqlAutomationStore, type AutomationStore } from "@vaulltcore/automation"
 import { SqlScheduleStore } from "@vaulltcore/scheduler"
 import { SqlOpsStore } from "@vaulltcore/ops"
 import { ModelRegistry } from "@vaulltcore/models"
-import { SqlCredentialStore, CredentialResolver } from "@vaulltcore/credentials"
-import type { BetterAuthAdapter } from "@vaulltcore/auth"
-import { SqlB2bAuthStore, ActorResolver, ServiceIdentityService } from "@vaulltcore/auth"
+import { SqlCredentialStore, CredentialResolver, InMemorySecretProvider } from "@vaulltcore/credentials"
+import { buildAutomationLayer } from "./automation-routes.js"
 
 const PORT = Number(process.env.PORT ?? 3000)
 const HOST = "0.0.0.0"
@@ -62,7 +61,8 @@ async function main(): Promise<void> {
 
   // Model registry (BYOK)
   const credentialStore = new SqlCredentialStore(database)
-  const credentialResolver = new CredentialResolver({ store: credentialStore })
+  const secretProvider = new InMemorySecretProvider()
+  const credentialResolver = new CredentialResolver({ store: credentialStore, secrets: secretProvider })
   const registry = new ModelRegistry({ credentialResolver })
 
   // Build the production runner
@@ -90,6 +90,14 @@ async function main(): Promise<void> {
     console.error("[vaulltcore] Worker error:", err)
   })
 
+  // Build automation layer (requires admission pipeline from control plane)
+  const automationLayer = buildAutomationLayer({
+    store: automationStore,
+    admission: null as any, // Will be set by ControlPlane
+    runner,
+    audit,
+  })
+
   // Wire up the control plane
   const controlPlane = new ControlPlane({
     runner,
@@ -113,10 +121,13 @@ async function main(): Promise<void> {
       opsStore,
       audit,
       automationStore: automationStore,
+      storage: jobStore.database() as any,
+      service: automationLayer.service,
     },
     phase2f: {
       metering,
       billing,
+      audit,
     },
   })
 

@@ -34,11 +34,19 @@ async function main(): Promise<void> {
   let database: any
 
   if (databaseUrl) {
-    // PostgreSQL via pg driver
+    // PostgreSQL via pg driver (Neon or standard PostgreSQL)
     const { Pool } = await import("pg")
-    const pool = new Pool({ connectionString: databaseUrl })
+    const isNeon = databaseUrl.includes(".neon.tech")
+    const poolConfig: import("pg").PoolConfig = {
+      connectionString: databaseUrl,
+      ssl: isNeon ? { rejectUnauthorized: true } : undefined,
+      max: 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    }
+    const pool = new Pool(poolConfig)
     database = pool
-    console.log("[vaulltcore] Connected to PostgreSQL")
+    console.log(`[vaulltcore] Connected to ${isNeon ? "Neon" : "PostgreSQL"} database`)
   } else {
     // SQLite fallback for development
     database = NodeSqliteDatabase.open("./vaulltcore.db")

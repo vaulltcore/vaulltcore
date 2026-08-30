@@ -24,6 +24,13 @@ primary_region = "iad"
 
 # Environment variables (set via Fly.io secrets)
 # Required:
-#   DATABASE_URL - PostgreSQL connection string
+#   DATABASE_URL - Neon PostgreSQL connection string (format: postgres://user:pass@ep-xxx.region.aws.neon.tech/dbname?sslmode=require)
 #   BETTER_AUTH_SECRET - Better Auth session secret
 #   SESSION_SECRET - Session encryption secret
+#
+# Neon Setup:
+#   1. Create a free account at https://neon.tech
+#   2. Create a new project (选择 AWS region closest to your Fly.io region)
+#   3. Copy the connection string from the Neon dashboard
+#   4. The connection string already includes sslmode=require
+#   5. Set it as a Fly.io secret: fly secrets set DATABASE_URL="postgres://..."

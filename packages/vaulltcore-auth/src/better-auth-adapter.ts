@@ -94,7 +94,7 @@ export class BetterAuthAdapter {
       if (value === undefined) continue
       headers.set(key, Array.isArray(value) ? value.join(",") : value)
     }
-    const webRequest = new Request(url, {
+    const webRequest = new Request(url.toString(), {
       method: request.method,
       headers,
       ...(request.body !== undefined ? { body: request.body } : {}),

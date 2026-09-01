@@ -1,6 +1,9 @@
-// Real API repository implementations using the typed API client
-// These implement the same interfaces as mock repositories
+// Real API repository implementations using the typed API client.
+// Every method routes through `apiRequest()` so authentication headers,
+// JSON encoding/decoding, error parsing, abort signals, and idempotency
+// keys are owned by exactly one transport layer.
 
+import { apiRequest } from "@/lib/api/client";
 import { jobsApi } from "@/lib/api/jobs";
 import { automationApi } from "@/lib/api/automation";
 import { schedulesApi } from "@/lib/api/schedules";
@@ -10,117 +13,137 @@ import { usageApi } from "@/lib/api/usage";
 import { operationsApi } from "@/lib/api/operations";
 import type { AppRepositories } from "./interfaces";
 
-function getAuthHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (typeof window !== "undefined") {
-    const tenant = localStorage.getItem("vc-tenant");
-    if (tenant) headers["x-vc-tenant"] = tenant;
-    const org = localStorage.getItem("vc-org");
-    if (org) headers["x-vc-org"] = org;
-    const project = localStorage.getItem("vc-project");
-    if (project) headers["x-vc-project"] = project;
-  }
-  return headers;
-}
-
-async function rawFetch<T>(path: string): Promise<T> {
-  const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:3000"}${path}`, {
-    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-    credentials: "include",
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
-
 export const realRepositories: AppRepositories = {
   jobs: {
-    async list() { return rawFetch("/jobs"); },
-    async get(jobId) { return jobsApi.get(jobId); },
-    async events(jobId, opts) { return jobsApi.events(jobId, opts); },
-    async cancel(jobId) { return jobsApi.cancel(jobId); },
-    async input(jobId, text) { return jobsApi.input(jobId, text); },
-    async usage(jobId) { return jobsApi.usage(jobId); },
+    async list(opts) {
+      return apiRequest<Awaited<ReturnType<typeof jobsApi.list>>>("/jobs", {
+        params: opts as Record<string, string | number | undefined>,
+      });
+    },
+    async get(jobId, signal) { return apiRequest(jobsApi.getUrl(jobId), { signal }); },
+    async events(jobId, opts, signal) {
+      return apiRequest(jobsApi.eventsUrl(jobId, opts), { signal });
+    },
+    async cancel(jobId, signal) { return apiRequest(jobsApi.cancelUrl(jobId), { method: "POST", signal }); },
+    async input(jobId, text, signal) {
+      return apiRequest(jobsApi.inputUrl(jobId), { method: "POST", body: { text }, signal });
+    },
+    async usage(jobId, signal) { return apiRequest(jobsApi.usageUrl(jobId), { signal }); },
   },
 
   automation: {
     templates: {
-      async list() { return automationApi.templates.list(); },
-      async create(body) { return automationApi.templates.create(body); },
-      async versions(templateId) { return automationApi.templates.versions(templateId); },
-      async createVersion(templateId, body) { return automationApi.templates.createVersion(templateId, body); },
+      async list(opts, signal) {
+        return apiRequest<{ templates: Awaited<ReturnType<typeof automationApi.templates.list>>["templates"] }>(
+          automationApi.templates.listUrl(),
+          { params: opts as Record<string, string | number | undefined>, signal }
+        );
+      },
+      async create(body, signal) { return apiRequest(automationApi.templates.createUrl(), { method: "POST", body, signal }); },
+      async versions(templateId, signal) { return apiRequest(automationApi.templates.versionsUrl(templateId), { signal }); },
+      async createVersion(templateId, body, signal) {
+        return apiRequest(automationApi.templates.createVersionUrl(templateId), { method: "POST", body, signal });
+      },
     },
     runs: {
-      async list() { return rawFetch("/automation/runs"); },
-      async get(runId) { return automationApi.runs.get(runId); },
-      async events(runId, opts) { return automationApi.runs.events(runId, opts); },
-      async artifacts(runId) { return automationApi.runs.artifacts(runId); },
-      async deliveries(runId) { return automationApi.runs.deliveries(runId); },
-      async advance(runId) { return automationApi.runs.advance(runId); },
-      async cancel(runId) { return automationApi.runs.cancel(runId); },
+      async list(opts, signal) {
+        return apiRequest<unknown[]>(automationApi.runs.listUrl(), {
+          params: opts as Record<string, string | number | undefined>,
+          signal,
+        });
+      },
+      async get(runId, signal) { return apiRequest(automationApi.runs.getUrl(runId), { signal }); },
+      async events(runId, opts, signal) {
+        return apiRequest(automationApi.runs.eventsUrl(runId, opts), { signal });
+      },
+      async artifacts(runId, signal) { return apiRequest(automationApi.runs.artifactsUrl(runId), { signal }); },
+      async deliveries(runId, signal) { return apiRequest(automationApi.runs.deliveriesUrl(runId), { signal }); },
+      async advance(runId, signal) { return apiRequest(automationApi.runs.advanceUrl(runId), { method: "POST", signal }); },
+      async cancel(runId, signal) { return apiRequest(automationApi.runs.cancelUrl(runId), { method: "POST", signal }); },
     },
     approvals: {
-      async approve(id, metadata) { return automationApi.approvals.approve(id, metadata); },
-      async reject(id, metadata) { return automationApi.approvals.reject(id, metadata); },
-      async requestChanges(id, metadata) { return automationApi.approvals.requestChanges(id, metadata); },
+      async approve(id, metadata, signal) {
+        return apiRequest(`/automation/approvals/${id}/approve`, { method: "POST", body: { metadata }, signal });
+      },
+      async reject(id, metadata, signal) {
+        return apiRequest(`/automation/approvals/${id}/reject`, { method: "POST", body: { metadata }, signal });
+      },
+      async requestChanges(id, metadata, signal) {
+        return apiRequest(`/automation/approvals/${id}/changes`, { method: "POST", body: { metadata }, signal });
+      },
     },
   },
 
   schedules: {
-    async list() { return schedulesApi.list(); },
-    async get(scheduleId) { return schedulesApi.get(scheduleId); },
-    async create(body) { return schedulesApi.create(body as Parameters<typeof schedulesApi.create>[0]); },
-    async pause(scheduleId) { return schedulesApi.pause(scheduleId); },
-    async resume(scheduleId) { return schedulesApi.resume(scheduleId); },
-    async cancel(scheduleId) { return schedulesApi.cancel(scheduleId); },
-    async occurrences(scheduleId) { return schedulesApi.occurrences(scheduleId); },
+    async list(opts, signal) { return apiRequest(schedulesApi.listUrl(), { params: opts as Record<string, string | number | undefined>, signal }); },
+    async get(scheduleId, signal) { return apiRequest(schedulesApi.getUrl(scheduleId), { signal }); },
+    async create(body, signal) { return apiRequest(schedulesApi.createUrl(), { method: "POST", body, signal }); },
+    async pause(scheduleId, signal) { return apiRequest(schedulesApi.pauseUrl(scheduleId), { method: "POST", signal }); },
+    async resume(scheduleId, signal) { return apiRequest(schedulesApi.resumeUrl(scheduleId), { method: "POST", signal }); },
+    async cancel(scheduleId, signal) { return apiRequest(schedulesApi.cancelUrl(scheduleId), { method: "POST", signal }); },
+    async occurrences(scheduleId, signal) { return apiRequest(schedulesApi.occurrencesUrl(scheduleId), { signal }); },
   },
 
   connections: {
-    async capabilities() {
-      const result = await connectionsApi.capabilities();
-      return { capabilities: result.capabilities.map(c => ({ ...c, family: "other" })) };
+    async capabilities(_, signal) { return apiRequest(connectionsApi.capabilitiesUrl(), { signal }); },
+    async list(opts, signal) {
+      return apiRequest<{ connections: Awaited<ReturnType<typeof connectionsApi.list>>["connections"] }>(
+        connectionsApi.listUrl(),
+        { params: opts as Record<string, string | number | undefined>, signal }
+      );
     },
-    async list() { return connectionsApi.list(); },
-    async get(connectionId) { return connectionsApi.get(connectionId); },
-    async create(body) { return connectionsApi.create(body as { provider: string; redirectUri: string }); },
-    async reconnect(connectionId) { return connectionsApi.reconnect(connectionId, { redirectUri: window.location.origin }); },
-    async refresh(connectionId) { return connectionsApi.refresh(connectionId); },
-    async disconnect(connectionId) { return connectionsApi.disconnect(connectionId); },
+    async get(connectionId, signal) { return apiRequest(connectionsApi.getUrl(connectionId), { signal }); },
+    async create(body, signal) { return apiRequest(connectionsApi.createUrl(), { method: "POST", body, signal }); },
+    async reconnect(connectionId, body, signal) {
+      return apiRequest(connectionsApi.reconnectUrl(connectionId), { method: "POST", body, signal });
+    },
+    async refresh(connectionId, signal) {
+      return apiRequest(connectionsApi.refreshUrl(connectionId), { method: "POST", signal });
+    },
+    async disconnect(connectionId, signal) {
+      return apiRequest(connectionsApi.disconnectUrl(connectionId), { method: "POST", signal });
+    },
   },
 
   triggers: {
-    async list() { return triggersApi.list(); },
-    async get(triggerId) { return triggersApi.get(triggerId); },
-    async create(body) { return triggersApi.create(body as Parameters<typeof triggersApi.create>[0]); },
-    async enable(triggerId) { return triggersApi.enable(triggerId); },
-    async disable(triggerId) { return triggersApi.disable(triggerId); },
-    async invoke(triggerId) { return triggersApi.invoke(triggerId); },
-    async dispatch(dispatchId) { return triggersApi.getDispatch(dispatchId); },
+    async list(_, signal) { return apiRequest(triggersApi.listUrl(), { signal }); },
+    async get(triggerId, signal) { return apiRequest(triggersApi.getUrl(triggerId), { signal }); },
+    async create(body, signal) { return apiRequest(triggersApi.createUrl(), { method: "POST", body, signal }); },
+    async enable(triggerId, signal) { return apiRequest(triggersApi.enableUrl(triggerId), { method: "POST", signal }); },
+    async disable(triggerId, signal) { return apiRequest(triggersApi.disableUrl(triggerId), { method: "POST", signal }); },
+    async invoke(triggerId, signal) { return apiRequest(triggersApi.invokeUrl(triggerId), { method: "POST", signal }); },
+    async dispatch(dispatchId, signal) { return apiRequest(triggersApi.getDispatchUrl(dispatchId), { signal }); },
   },
 
   usage: {
-    async list(params) {
-      return usageApi.list(params || { cursor: undefined, limit: 200 });
+    async list(params, signal) {
+      return apiRequest(usageApi.listUrl(), { params: params as Record<string, string | number | undefined>, signal });
     },
-    async summary(params) { return usageApi.summary(params); },
-    async run(runId) { return usageApi.runUsage(runId); },
-    async ledger(params) {
-      return usageApi.ledger(params || { cursor: undefined, limit: 200 });
+    async summary(params, signal) {
+      return apiRequest(usageApi.summaryUrl(), { params: params as Record<string, string | number | undefined>, signal });
+    },
+    async run(runId, signal) { return apiRequest(usageApi.runUsageUrl(runId), { signal }); },
+    async ledger(params, signal) {
+      return apiRequest(usageApi.ledgerUrl(), { params: params as Record<string, string | number | undefined>, signal });
     },
   },
 
   operations: {
-    async retryStatus() { return operationsApi.retryStatus(); },
-    async health() { return operationsApi.healthReliability(); },
-    async deadLetter() { return operationsApi.deadLetter(); },
-    async redrive(id) { return operationsApi.redrive(id); },
-    async dispatchRedrive(id) { return operationsApi.redriveDispatch(id); },
-    async reconcile() { return operationsApi.reconcile(); },
-    async timeoutScan() { return operationsApi.timeoutScan(); },
-    async readiness() { return operationsApi.readiness(); },
+    async retryStatus(opts, signal) {
+      return apiRequest(operationsApi.retryStatusUrl(), { params: opts as Record<string, string | number | undefined>, signal });
+    },
+    async health(_, signal) { return apiRequest(operationsApi.healthReliabilityUrl(), { signal }); },
+    async deadLetter(_, signal) { return apiRequest(operationsApi.deadLetterUrl(), { signal }); },
+    async redrive(id, signal) { return apiRequest(operationsApi.redriveUrl(id), { method: "POST", signal }); },
+    async dispatchRedrive(id, signal) { return apiRequest(operationsApi.redriveDispatchUrl(id), { method: "POST", signal }); },
+    async reconcile(_, signal) { return apiRequest(operationsApi.reconcileUrl(), { method: "POST", signal }); },
+    async timeoutScan(_, signal) { return apiRequest(operationsApi.timeoutScanUrl(), { method: "POST", signal }); },
+    async readiness(_, signal) { return apiRequest(operationsApi.readinessUrl(), { signal }); },
   },
 
   metrics: {
-    async get() { return rawFetch("/automation/metrics"); },
+    async get(_, signal) {
+      return apiRequest(operationsApi.metricsUrl(), { signal });
+    },
   },
 };
